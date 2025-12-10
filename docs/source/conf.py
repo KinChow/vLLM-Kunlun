@@ -115,7 +115,7 @@ html_theme = "sphinx_book_theme"
 html_logo = "logos/vllm-kunlun-logo-text-light.png"
 html_theme_options = {
     "path_to_docs": "docs/source",
-    "repository_url": "https://github.com/xxxxx/vllm-kunlun",
+    "repository_url": "https://github.com/baidu/vLLM-Kunlun",
     "use_repository_button": True,
     "use_edit_page_button": True,
 }
