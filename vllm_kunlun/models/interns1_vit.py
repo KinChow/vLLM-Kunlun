@@ -253,7 +253,6 @@ class InternS1VisionMLP(nn.Module):
 
         self.config = config
         self.activation_fn = get_act_fn(config.hidden_act)
-        # self.activation_fn = GeluAndMul()
         self.fc1 = ColumnParallelLinear(config.hidden_size,
                                         config.intermediate_size,
                                         bias=True,

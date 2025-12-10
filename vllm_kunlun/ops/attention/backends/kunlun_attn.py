@@ -271,13 +271,6 @@ class KunlunMetadata(AttentionMetadata, PagedAttentionMetadata):
             if self.context_lens_tensor is None
             else self.context_lens_tensor[: self.num_prefills]
         )
-        # for prefix cache, block table only contains blocks that hit
-        # if self.block_tables is None:
-        #     block_tables = None
-        # elif self.block_tables.shape[1] == 0:
-        #     block_tables = self.block_tables[:self.num_prefills]
-        # else:
-        #     block_tables = self.block_tables[:self.num_prefills][:, -1].clone()
 
         block_tables = (
             None
@@ -442,7 +435,6 @@ class KunlunMetadataBuilder(CommonMetadataBuilder[KunlunMetadata]):
             if inter_data.prefix_cache_hit:
                 assert context_len != 0
                 assert context_len % self.block_size == 0
-                # block_table = block_tables[seq_id]
                 block_table = block_tables[seq_id][: context_len // self.block_size]
             elif (not is_prompt) and block_tables is not None:
                 if curr_sliding_window_block == 0:
@@ -483,7 +475,6 @@ class KunlunMetadataBuilder(CommonMetadataBuilder[KunlunMetadata]):
             query_start_loc, dtype=torch.int32, device="cpu"
         )
         attn_meta.query_start_loc_host = query_start_loc_host
-        # max_kv_len = max(query_lens + prefix_cache_kv_lens)
         attn_meta.max_kv_len = max(self.prefix_cache_kv_lens + attn_meta.seq_lens)
 
         # If kv cache is included and there is a hit

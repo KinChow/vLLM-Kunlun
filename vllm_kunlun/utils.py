@@ -200,7 +200,6 @@ class ModuleLoggingHookPost(object):
         self.name_list.pop()
 
 
-# if os.environ.get("ENABLE_VLLM_MODULE_HOOK", "0") == "1":
 if xenvs.ENABLE_VLLM_MODULE_HOOK:
     from torch.nn.modules.module import (
         register_module_forward_pre_hook,

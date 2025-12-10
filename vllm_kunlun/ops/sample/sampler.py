@@ -516,10 +516,6 @@ def _apply_top_k_top_p(
     top_p_mask[:, -1] = False
     logits_sort.masked_fill_(top_p_mask, -float("inf"))
 
-    # Re-sort the probabilities.
-    # logits = torch.empty_like(logits_sort).scatter_(dim=-1,
-    #                                                 index=logits_idx,
-    #                                                 src=logits_sort)
     return logits_sort, logits_idx
 
 
@@ -883,7 +879,6 @@ def _sample_with_torch(
                     seq_groups=seq_groups_arg,
                 )
                 if logits_idx is not None:
-                    # multinomial_samples[sampling_type] = logits_idx[:, result_idx[:][0]]
                     token_ids = logits_idx[long_sample_indices].gather(
                         dim=1, index=result_idx.to(logits_idx.device)
                     )

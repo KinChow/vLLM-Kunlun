@@ -73,7 +73,6 @@ class KunlunOps:
         alibi_sqrt=False,
     ):
         """PagedAttentionV1"""
-        # block_size = value_cache.shape[2]
         xtorch_ops.paged_attention(
             x=query,
             k_cache=key_cache,
@@ -116,7 +115,6 @@ class KunlunOps:
         alibi_sqrt=False,
     ):
         """PagedAttentionV2"""
-        # block_size = value_cache.shape[2]
         xtorch_ops.paged_attention(
             x=query,
             k_cache=key_cache,
@@ -221,17 +219,6 @@ class KunlunOps:
         num_heads = query_x.shape[1] // head_size
         num_kv_heads = key_x.shape[1] // head_size
 
-        # # [num_tokens, num_heads * head_size] -> [num_tokens, num_heads, head_size]
-        # query_x = query_x.view(num_tokens, num_heads, head_size)
-        # # [num_tokens, num_kv_heads * head_size] -> [num_tokens, num_kv_heads, head_size]
-        # key_x = key_x.view(num_tokens, num_kv_heads, head_size)
-
-        # # Ensure shapes are correct
-        # assert query_x.shape == (num_tokens, num_heads, head_size), \
-        #     f"Expected query shape [{num_tokens}, {num_heads}, {head_size}], got {query_x.shape}"
-        # assert key_x.shape == (num_tokens, num_kv_heads, head_size), \
-        #     f"Expected key shape [{num_tokens}, {num_kv_heads}, {head_size}], got {key_x.shape}"
-
         torch.ops._C.rotary_embedding(
             positions, query_x, key_x, head_size, cos_sin_cache, is_neox_style
         )
@@ -239,8 +226,6 @@ class KunlunOps:
         query_x = query_x.view(num_tokens, num_heads * head_size)
         key_x = key_x.view(num_tokens, num_kv_heads * head_size)
 
-        # query.data = query_x
-        # key.data  = key_x
         return query_x, key_x
 
     # Rotary embedding
@@ -290,7 +275,6 @@ class KunlunOps:
         kv_cache_dtype,
     ):
         """reshape_and_cache"""
-        # slot_mapping_cast = slot_mapping.to(torch.int32)
         xtorch_ops.reshape_and_cache(key, value, key_cache, value_cache, slot_mapping)
 
     @staticmethod
