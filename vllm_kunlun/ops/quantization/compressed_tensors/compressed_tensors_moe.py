@@ -32,7 +32,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     find_matched_target,
 )
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
-from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_native
+from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_kunlun
 
 logger = init_logger(__name__)
 
@@ -314,11 +314,11 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         # dequant packed weights to float16
-        w13_weight = dequant_int4_native(
+        w13_weight = dequant_int4_kunlun(
             weight_packed_uint8=layer.w13_weight_packed,
             scale=self.moe_quant_config.w1_scale,
         )
-        w2_weight = dequant_int4_native(
+        w2_weight = dequant_int4_kunlun(
             weight_packed_uint8=layer.w2_weight_packed,
             scale=self.moe_quant_config.w2_scale,
         )
