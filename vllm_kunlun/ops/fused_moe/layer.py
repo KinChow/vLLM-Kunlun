@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
     UnquantizedFusedMoEMethod,
     FusedMoE,
 )
+from vllm_kunlun.ops.fused_moe.fused_moe import grouped_topk
 
 
 class KunlunUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
@@ -175,6 +176,66 @@ class KunlunFusedMoE(FusedMoE):
                 "weight_loader": self.weight_loader,
             }
             self.quant_method.create_weights(layer=self, **moe_quant_params)
+            
+    @staticmethod
+    def select_experts(
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        use_grouped_topk: bool,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        indices_type: Optional[torch.dtype] = None,
+        enable_eplb: bool = False,
+        expert_map: Optional[torch.Tensor] = None,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
+        global_num_experts: Optional[int] = None,
+        zero_expert_num: Optional[int] = None,
+        zero_expert_type: Optional[str] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Route the input hidden states to the top-k experts based on the
+        router logits.
+
+        Returns:
+                (topk_weights, topk_ids, zero_expert_result) 
+                (tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
+                The weights, expert ids, and zero expert computation result.
+
+            **Compatibility**: When EPLB is not enabled, the returned ids are
+            equivalent to global logical ids, so should be compatible with
+            plain MoE implementations without redundant experts.
+        """
+        # DeepSeekv2 uses grouped_top_k
+        if use_grouped_topk:
+            assert topk_group is not None
+            assert num_expert_group is not None
+            topk_weights, topk_ids = grouped_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+                num_expert_group=num_expert_group,
+                topk_group=topk_group,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias)
+            if indices_type is not None:
+                topk_ids = topk_ids.to(dtype=indices_type)
+        else:
+            raise NotImplementedError("Only grouped_topk is supported in KunlunFusedMoE for now.")
+
+        assert topk_ids.dtype == indices_type or indices_type is None
+
+        zero_expert_result = None
+        return topk_weights, topk_ids, zero_expert_result
 
 
 # monkey patch

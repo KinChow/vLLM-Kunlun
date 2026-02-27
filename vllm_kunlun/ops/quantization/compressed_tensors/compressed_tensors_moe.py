@@ -32,6 +32,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
     find_matched_target,
 )
 from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+from vllm_kunlun.ops.fused_moe.layer import KunlunFusedMoE
 from vllm_kunlun.ops.quantization.kernels.quant_ops import dequant_int4_native
 
 logger = init_logger(__name__)
@@ -39,7 +40,7 @@ logger = init_logger(__name__)
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
-    def __init_(self, moe: FusedMoEConfig):
+    def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
 
     @staticmethod
@@ -313,49 +314,41 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
         logical_to_physical_map: Optional[torch.Tensor] = None,
         logical_replica_count: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        # dequant packed weights to float16
-        w13_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w13_weight_packed,
-            scale=self.moe_quant_config.w1_scale,
-        )
-        w2_weight = dequant_int4_native(
-            weight_packed_uint8=layer.w2_weight_packed,
-            scale=self.moe_quant_config.w2_scale,
-        )
-        
-        if self.moe.use_ep:
-            return ops.fused_moe_ep(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-            )
-        else:
-            return ops.fused_moe(
-                x,
-                w13_weight,
-                w2_weight,
-                router_logits,
-                self.moe.ep_rank,
-                top_k,
-                renormalize=renormalize,
-                inplace=True,
-                use_grouped_topk=use_grouped_topk,
-                num_expert_group=num_expert_group,
-                topk_group=topk_group,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-                w1_bias=getattr(layer, "w13_bias", None),
-                w2_bias=getattr(layer, "w2_bias", None),
+        if enable_eplb:
+            raise NotImplementedError(
+                "EPLB not supported for `CompressedTensorsWNA16MoEMethod` yet."
             )
 
+        from vllm_kunlun.ops.fused_moe.fused_moe import fused_experts
+
+        topk_weights, topk_ids, _ = KunlunFusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            routed_scaling_factor=routed_scaling_factor,
+            e_score_correction_bias=e_score_correction_bias,
+            indices_type=self.topk_indices_dtype,
+        )
+
+        return fused_experts(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            inplace=True,
+            activation=activation,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
+            expert_map=expert_map,
+            quant_config=self.moe_quant_config,
+        )
 
 # monkey patch
 from vllm.model_executor.layers.quantization.compressed_tensors import (
