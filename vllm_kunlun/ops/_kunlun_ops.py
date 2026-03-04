@@ -609,6 +609,215 @@ class KunlunOps:
             return output
 
     @staticmethod
+    def fused_moe_int4(
+        hidden_states: torch.Tensor,
+        w13_weight_packed: torch.Tensor,
+        w2_weight_packed: torch.Tensor,
+        w13_scale: torch.Tensor,
+        w2_scale: torch.Tensor,
+        router_logits: torch.Tensor,
+        moe_top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        num_expert_group: Optional[int] = None,
+        topk_group: Optional[int] = None,
+        scoring_func: str = "softmax",
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        tp_rank: int = 0
+    ) -> torch.Tensor:
+        """fused_moe with packed int4 weights
+        This is similar to fused_moe but uses packed int4 weights directly
+        without dequantization to float16.
+        Uses torch.ops._C.moe_fc_v3 which supports int4 packed weights.
+        """
+        def _log_tensor_info(name: str, tensor: torch.Tensor | None) -> str:
+            """Helper function to format tensor information for logging."""
+            if tensor is None:
+                return f"  {name}: None"
+            return f"  {name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, min={tensor.to(torch.float32).min().item()}, max={tensor.to(torch.float32).max().item()}"
+        # Get shapes from packed weights
+        # packed int4 shape: [global_num_experts, output_dim, input_dim//2]
+        global_num_experts, up_gate_size_packed, _ = w13_weight_packed.shape
+        M, N = hidden_states.shape
+
+        # For packed int4, actual dimensions are doubled
+        up_gate_size = up_gate_size_packed * 2
+        _, hidden_dim_packed, _ = w2_weight_packed.shape
+        hidden_dim = hidden_dim_packed * 2
+
+        # Initialize tensors for topk selection
+        normed_score = torch.empty(M,
+                            moe_top_k,
+                            dtype=torch.float32,
+                            device=hidden_states.device)
+        topk_ids = torch.empty(M,
+                        moe_top_k,
+                        dtype=torch.int32,
+                        device=hidden_states.device)
+
+        num_blocks = 12
+        block_statistic = torch.zeros(
+            num_blocks, global_num_experts, dtype=torch.int32, device=hidden_states.device
+        )
+
+        # TopK routing
+        router_logits = router_logits.to(torch.float)
+        if scoring_func == "softmax":
+            torch.ops._C.moe_softmax_topk_norm(
+                x=router_logits,
+                normed_score=normed_score,
+                topk_index=topk_ids,
+                block_statistic=None,
+                stable=True)
+        elif scoring_func == "sigmoid":
+            torch.ops._C.moe_sigmoid_group_topk_norm(
+                    x=router_logits,
+                    topk_index=topk_ids,
+                    norm_score=normed_score,
+                    block_static=block_statistic,
+                    bias=e_score_correction_bias,
+                    scale=1.0,
+                    n_group=num_expert_group,
+                    topk_group=topk_group,
+                )
+        else:
+            raise ValueError(f"Unsupported scoring_func: {scoring_func}")
+
+        # Generate block statistic
+        torch.ops._C.gen_block_statistic(topk_ids, block_statistic)
+
+        # Pre-sort tokens by expert
+        moe_expand = torch.empty((M * moe_top_k, N), dtype=hidden_states.dtype, device=hidden_states.device)
+        expert_m = torch.zeros(global_num_experts, dtype=torch.int32, device=hidden_states.device)
+        sorted_tokens_num_lod = torch.zeros(global_num_experts + 1, dtype=torch.int32, device=hidden_states.device)
+        sorted_tokens_idx = torch.zeros(M * moe_top_k, dtype=torch.int32, device=hidden_states.device)
+
+        torch.ops._C.moe_pre_sorted(
+            x=hidden_states,
+            topk_index=topk_ids,
+            block_statistic=block_statistic,
+            moe_expand=moe_expand,
+            moe_index=sorted_tokens_idx,
+            expert_m=expert_m,
+            sorted_tokens_num_lod=sorted_tokens_num_lod)
+
+        # First FC layer (w13)
+        y = torch.empty(M * moe_top_k,
+                up_gate_size,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+
+        # Log parameters before first moe_fc_v3 call
+        # log_info = "moe_fc_v3 (w13 layer) parameters:\n"
+        # log_info += _log_tensor_info("x (moe_expand)", moe_expand) + "\n"
+        # log_info += _log_tensor_info("weight (w13_weight_packed)", w13_weight_packed) + "\n"
+        # log_info += _log_tensor_info("sorted_tokens_num_lod", sorted_tokens_num_lod) + "\n"
+        # log_info += _log_tensor_info("sorted_tokens_idx", sorted_tokens_idx) + "\n"
+        # log_info += _log_tensor_info("w_perchannel_max (w13_scale)", w13_scale) + "\n"
+        # log_info += f"  moe_topk: {moe_top_k}\n"
+        # log_info += f"  use_pack_int4: True\n"
+        # log_info += f"  sort_mode: True\n"
+        # log_info += f"  recommended_expert_tokens: {recommended_expert_tokens}\n"
+        # log_info += _log_tensor_info("y (output)", y)
+        # print(log_info)
+
+        # Create x_perchannel_max (input quantization scale) with same shape as moe_expand
+        x_perchannel_max = torch.ones(M * moe_top_k, N, dtype=torch.float32, device=hidden_states.device)
+
+        # moe_fc_v3 expects packed int4 weights in uint8 [0,15] format
+        # The kernel internally handles the conversion from [0,15] to [-8,7]
+        w13_weight_packed_signed = w13_weight_packed.to(torch.int8)
+
+        # Note: w13_scale should already be multiplied by 7.0 in the caller
+        w13_scale_fp32 = w13_scale.to(torch.float32)
+
+        # Call moe_fc_v3 with packed int4 weights for first layer
+        torch.ops._C.moe_fc_v3(
+            x=moe_expand,
+            weight=w13_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=y,
+            x_perchannel_max=x_perchannel_max,
+            w_perchannel_max=w13_scale_fp32,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+
+        # Activation: silu_and_mul
+        d = y.shape[-1] // 2
+        output_shape = (y.shape[:-1] + (d,))
+        out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
+        torch.ops._C.silu_and_mul(out1, y)
+
+        # Second FC layer (w2)
+        out = torch.empty(M * moe_top_k,
+                hidden_dim,
+                dtype=hidden_states.dtype,
+                device=hidden_states.device)
+
+        out1 = out1.reshape(-1, out1.shape[-1])
+
+        # Log parameters before second moe_fc_v3 call
+        # log_info = "moe_fc_v3 (w2 layer) parameters:\n"
+        # log_info += _log_tensor_info("x (out1)", out1) + "\n"
+        # log_info += _log_tensor_info("weight (w2_weight_packed)", w2_weight_packed) + "\n"
+        # log_info += _log_tensor_info("sorted_tokens_num_lod", sorted_tokens_num_lod) + "\n"
+        # log_info += _log_tensor_info("sorted_tokens_idx", sorted_tokens_idx) + "\n"
+        # log_info += _log_tensor_info("w_perchannel_max (w2_scale)", w2_scale) + "\n"
+        # log_info += f"  moe_topk: {moe_top_k}\n"
+        # log_info += f"  use_pack_int4: True\n"
+        # log_info += f"  sort_mode: True\n"
+        # log_info += f"  recommended_expert_tokens: {recommended_expert_tokens}\n"
+        # log_info += _log_tensor_info("y (output)", out)
+        # print(log_info)
+
+        # Create x_perchannel_max (input quantization scale) with same shape as out1
+        x2_perchannel_max = torch.ones(M * moe_top_k, out1.shape[-1], dtype=torch.float32, device=hidden_states.device)
+
+        # moe_fc_v3 expects packed int4 weights in uint8 [0,15] format
+        # The kernel internally handles the conversion from [0,15] to [-8,7]
+        w2_weight_packed_signed = w2_weight_packed.to(torch.int8)
+
+        # Keep the scale as-is (already multiplied by 7.0)
+        w2_scale_fp32 = w2_scale.to(torch.float32)
+
+        # Call moe_fc_v3 with packed int4 weights for second layer
+        torch.ops._C.moe_fc_v3(
+            x=out1,
+            weight=w2_weight_packed_signed,
+            sorted_tokens_num_lod=sorted_tokens_num_lod,
+            sorted_tokens_idx=sorted_tokens_idx,
+            moe_topk=moe_top_k,
+            y=out,
+            x_perchannel_max=x2_perchannel_max,
+            w_perchannel_max=w2_scale_fp32,
+            use_pack_int4=True,
+            sort_mode=True,
+        )
+
+        del out1
+
+        # Post-processing: reshape and weight by normed_score
+        dequant_scale = torch.ones([M, moe_top_k], dtype=torch.float32, device=out.device)
+        output = torch.empty([M, N], dtype=hidden_states.dtype, device=hidden_states.device)
+        sorted_tokens_idx = sorted_tokens_idx.view(M, moe_top_k)
+
+        # Reshape out to 3D for moe_post
+        out = out.view(M, moe_top_k, hidden_dim)
+
+        torch.ops._C.moe_post(
+            x=out,
+            moe_index=sorted_tokens_idx,
+            normed_scale=normed_score,
+            dequant_scale=dequant_scale,
+            y=output
+        )
+
+        return output
+
+    @staticmethod
     def fused_moe_ep(
         hidden_states: torch.Tensor,
         w13_weight: torch.Tensor,
