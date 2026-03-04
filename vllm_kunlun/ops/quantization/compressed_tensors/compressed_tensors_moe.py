@@ -39,7 +39,7 @@ logger = init_logger(__name__)
 
 class KunlunCompressedTensorsMoEMethod(FusedMoEMethodBase):
 
-    def __init_(self, moe: FusedMoEConfig):
+    def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
 
     @staticmethod
@@ -290,7 +290,7 @@ class KunlunCompressedTensorsW8A8Int8MoEMethod(CompressedTensorsW8A8Int8MoEMetho
 
 class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
-    def apply(
+    def _apply(
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
@@ -355,6 +355,60 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
                 w1_bias=getattr(layer, "w13_bias", None),
                 w2_bias=getattr(layer, "w2_bias", None),
             )
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool = False,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        global_num_experts: int = -1,
+        expert_map: Optional[torch.Tensor] = None,
+        custom_routing_function: Optional[Callable] = None,
+        scoring_func: str = "softmax",
+        routed_scaling_factor: float = 1.0,
+        e_score_correction_bias: Optional[torch.Tensor] = None,
+        apply_router_weight_on_input: bool = False,
+        activation: str = "silu",
+        enable_eplb: bool = False,
+        expert_load_view: Optional[torch.Tensor] = None,
+        logical_to_physical_map: Optional[torch.Tensor] = None,
+        logical_replica_count: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        # EP mode is not supported for int4 packed weights
+        if self.moe.use_ep:
+            raise NotImplementedError("EP mode is not supported for int4 packed weights yet.")
+
+        # Use packed int4 weights directly without dequantization
+        w13_weight_packed = layer.w13_weight_packed
+        w2_weight_packed = layer.w2_weight_packed
+
+        # Scale 预处理：乘以 int4 最大绝对值 7
+        # moe_fc_v3 内核期望的 scale 已经包含了量化范围的最大值
+        # int4 的值域是 [-8, 7]，最大绝对值是 7
+        w13_scale = self.moe_quant_config.w1_scale * 7.0
+        w2_scale = self.moe_quant_config.w2_scale * 7.0
+
+        # Call fused_moe_int4 which handles packed int4 weights efficiently
+        return ops.fused_moe_int4(
+            hidden_states=x,
+            w13_weight_packed=w13_weight_packed,
+            w2_weight_packed=w2_weight_packed,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            router_logits=router_logits,
+            moe_top_k=top_k,
+            renormalize=renormalize,
+            use_grouped_topk=use_grouped_topk,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+        )
 
 
 # monkey patch
