@@ -781,7 +781,7 @@ class KunlunOps:
         return output
 
     @staticmethod
-    def fuse_moe_ct_w4a16(
+    def fused_moe_ct_w4a16(
         hidden_states: torch.Tensor,
         w13_weight_packed_signed: torch.Tensor,
         w2_weight_packed_signed: torch.Tensor,
@@ -795,7 +795,6 @@ class KunlunOps:
         topk_group: Optional[int] = None,
         scoring_func: str = "softmax",
         e_score_correction_bias: Optional[torch.Tensor] = None,
-        tp_rank: int = 0
     ) -> torch.Tensor:
         """Optimized fused_moe with preprocessed packed int4 weights.
 
@@ -821,7 +820,6 @@ class KunlunOps:
             topk_group: Number of top groups for grouped topk
             scoring_func: Scoring function ("softmax" or "sigmoid")
             e_score_correction_bias: Bias for sigmoid scoring
-            tp_rank: Tensor parallel rank
 
         Returns:
             Output tensor [M, N]
@@ -887,6 +885,7 @@ class KunlunOps:
             moe_index=sorted_tokens_idx,
             expert_m=expert_m,
             sorted_tokens_num_lod=sorted_tokens_num_lod)
+        del expert_m, block_statistic  # Release after moe_pre_sorted
 
         # First FC layer (w13) - use preprocessed weights directly
         y = torch.empty(M * moe_top_k,
@@ -894,7 +893,12 @@ class KunlunOps:
                 dtype=hidden_states.dtype,
                 device=hidden_states.device)
 
-        x_perchannel_max = torch.ones(M * moe_top_k, N, dtype=torch.float32, device=hidden_states.device)
+        # Pre-allocate perchannel_max buffer for both w13 and w2 (memory reuse)
+        # w13 needs shape [M*top_k, N], w2 needs shape [M*top_k, up_gate_size//2]
+        max_perchannel_dim = max(N, up_gate_size // 2)
+        perchannel_max_buffer = torch.ones(M * moe_top_k, max_perchannel_dim,
+                                           dtype=torch.float32, device=hidden_states.device)
+        x_perchannel_max = perchannel_max_buffer[:, :N]
 
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
         torch.ops._C.moe_fc_v3(
@@ -909,12 +913,14 @@ class KunlunOps:
             use_pack_int4=True,
             sort_mode=True,
         )
+        del moe_expand, x_perchannel_max  # Release after first FC
 
         # Activation: silu_and_mul
         d = y.shape[-1] // 2
         output_shape = (y.shape[:-1] + (d,))
         out1 = torch.empty(output_shape, dtype=y.dtype, device=y.device)
         torch.ops._C.silu_and_mul(out1, y)
+        del y  # Release y after silu_and_mul
 
         # Second FC layer (w2) - use preprocessed weights directly
         out = torch.empty(M * moe_top_k,
@@ -923,7 +929,8 @@ class KunlunOps:
                 device=hidden_states.device)
 
         out1 = out1.reshape(-1, out1.shape[-1])
-        x2_perchannel_max = torch.ones(M * moe_top_k, out1.shape[-1], dtype=torch.float32, device=hidden_states.device)
+        # Reuse perchannel_max_buffer for w2 (memory optimization)
+        x2_perchannel_max = perchannel_max_buffer[:, :d]
 
         # Use preprocessed weights and scale directly (no XOR or type conversion needed)
         torch.ops._C.moe_fc_v3(
@@ -939,7 +946,7 @@ class KunlunOps:
             sort_mode=True,
         )
 
-        del out1
+        del out1, x2_perchannel_max, perchannel_max_buffer
 
         # Post-processing: reshape and weight by normed_score
         dequant_scale = torch.ones([M, moe_top_k], dtype=torch.float32, device=out.device)
