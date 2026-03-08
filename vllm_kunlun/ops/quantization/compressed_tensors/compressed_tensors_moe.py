@@ -448,7 +448,7 @@ class KunlunCompressedTensorsWNA16MoEMethod(CompressedTensorsWNA16MoEMethod):
 
         # Use preprocessed weights and scales (processed in process_weights_after_loading)
         # Weights are already int8 (XOR 0x88) and scales are already float32 (multiplied by 7.0)
-        return ops.fuse_moe_ct_w4a16(
+        return ops.fused_moe_ct_w4a16(
             hidden_states=x,
             w13_weight_packed_signed=layer.w13_weight_packed,
             w2_weight_packed_signed=layer.w2_weight_packed,
