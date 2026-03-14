@@ -11,9 +11,11 @@ This document describes how to install vllm-kunlun manually.
   - vLLM (same version as vllm-kunlun)
 
 ## Setup environment using container
+
 We provide a clean, minimal base image for your use`wjie520/vllm_kunlun:uv_base`.You can pull it using the `docker pull wjie520/vllm_kunlun:uv_base` command.
 
 We also provide images with xpytorch and ops installed.You can pull it using the `wjie520/vllm_kunlun:base_v0.0.2 and wjie520/vllm_kunlun:base_mimo_v0.0.2 (Only MIMO_V2 and GPT-OSS)` command
+
 ### Container startup script
 
 :::::{tab-set}
@@ -22,6 +24,7 @@ We also provide images with xpytorch and ops installed.You can pull it using the
 ::::{tab-item} start_docker.sh
 :selected:
 :sync: uv pip
+
 ```{code-block} bash
 #!/bin/bash
 XPU_NUM=8
@@ -45,16 +48,23 @@ docker run -itd ${DOCKER_DEVICE_CONFIG} \
     -w /workspace \
     "$build_image" /bin/bash
 ```
+
 ::::
 :::::
+
 ## Install vLLM-kunlun
+
 ### Install vLLM 0.11.0
-```
+
+```bash
 uv pip install vllm==0.11.0 --no-build-isolation --no-deps
 ```
+
 ### Build and Install
+
 Navigate to the vllm-kunlun directory and build the package:
-```
+
+```bash
 git clone https://github.com/baidu/vLLM-Kunlun
 
 cd vLLM-Kunlun
@@ -67,83 +77,76 @@ python setup.py install
 ```
 
 ### Replace eval_frame.py
+
 Copy the eval_frame.py patch:
-```
+
+```bash
 cp vllm_kunlun/patches/eval_frame.py /root/miniconda/envs/vllm_kunlun_0.10.1.1/lib/python3.10/site-packages/torch/_dynamo/eval_frame.py
 ```
 
 ## Choose to download customized xpytorch
 
 ### Install the KL3-customized build of PyTorch
-```
-wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-02T05%3A01%3A27Z%2F-1%2Fhost%2Ff3cf499234f82303891aed2bcb0628918e379a21e841a3fac6bd94afef491ff7
-(for the conda)
+
+```bash
+wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://baidu-kunlun-customer.su.bcebos.com/aiak/qwen3_next/20260226/xpytorch-cp310-torch251-ubuntu2004-x64.run
+
+#for conda
 bash xpytorch-cp310-torch251-ubuntu2004-x64.run
-(for the uv)
+
+#for uv
 bash xpytorch-cp310-torch251-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
 sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
 ```
-### Install the KL3-customized build of PyTorch (Only MIMO V2)
-```
-wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1231/xpytorch-cp310-torch251-ubuntu2004-x64.run
-(for the conda)
-bash xpytorch-cp310-torch251-ubuntu2004-x64.run
-(for the uv)
-bash xpytorch-cp310-torch251-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
-sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g' setup.sh && bash setup.sh
 
-```
-
-### Install the KL3-customized build of PyTorch (Only DeepSeek-V3.2-Exp-w8a8)
-```
-wget -O xpytorch-cp310-torch251-ubuntu2004-x64.run https://aihc-private-hcd.bj.bcebos.com/v1/vllm-kunlun-ds/xpytorch-cp310-torch251-ubuntu2004-x64.run?authorization=bce-auth-v1%2FALTAKvz6x4eqcmSsKjQxq3vZdB%2F2026-02-03T01%3A59%3A40Z%2F-1%2Fhost%2Ffc4b6f5b83c2fde70d48fdfc23c40c396efc9cb3c36d6f811fdca5f109073321
-(for the conda)
-bash xpytorch-cp310-torch251-ubuntu2004-x64.run
-(for the uv)
-bash xpytorch-cp310-torch251-ubuntu2004-x64.run --noexec --target xpytorch_unpack && cd xpytorch_unpack/ && \
-mv torch_xray-999.9.9-cp310-cp310-linux_x86_64.whl torch_xray-2.0.3-cp310-cp310-linux_x86_64.whl && \
-sed -i 's/pip/uv pip/g; s/CONDA_PREFIX/VIRTUAL_ENV/g; s/torch_xray-999.9.9/torch_xray-2.0.3/' setup.sh && bash setup.sh
-```
 ## Choose to download customized ops
 
 ### Install custom ops
-```
-uv pip install "https://baidu-kunlun-public.su.bcebos.com/v1/baidu-kunlun-share/1130/xtorch_ops-0.1.2209%2B6752ad20-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKypXxBzU7gg4Mk4K4c6OYR%2F2025-12-05T06%3A18%3A00Z%2F-1%2Fhost%2F14936c2b7e7c557c1400e4c467c79f7a9217374a7aa4a046711ac4d948f460cd"
-```
-### Install custom ops (Only MIMO V2)
-```
-uv pip install "https://vllm-ai-models.bj.bcebos.com/v1/vLLM-Kunlun/ops/swa/xtorch_ops-0.1.2109%252B523cb26d-cp310-cp310-linux_x86_64.whl"
-```
-### Install custom ops (Only DeepSeek-V3.2-Exp-w8a8)
-```
-uv pip install "https://klx-sdk-release-public.su.bcebos.com/kunlun2aiak_output/1215/xtorch_ops-0.1.2263%2Bc030eebd-cp310-cp310-linux_x86_64.whl"
+
+```bash
+uv pip install "https://baidu-kunlun-customer.su.bcebos.com/aiak/mimo/20260227/kunlun_ops-0.1.58+ee39020a-cp310-cp310-linux_x86_64.whl"
 ```
 
-## Install the KLX3 custom Triton build
-```
+### Install the KLX3 custom Triton build
+
+```bash
 uv pip install "https://cce-ai-models.bj.bcebos.com/v1/vllm-kunlun-0.11.0/triton-3.0.0%2Bb2cde523-cp310-cp310-linux_x86_64.whl"
 ```
-## Install the AIAK custom ops library
-```
-uv pip install "https://vllm-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20260130_152557/xspeedgate_ops-0.0.0%2Be5cdcbe-cp310-cp310-linux_x86_64.whl?authorization=bce-auth-v1%2FALTAKhvtgrTA8US5LIc8Vbl0mP%2F2026-01-30T10%3A33%3A32Z%2F2592000%2Fhost%2F3c13d67cc61d0df7538c198f5c32422f3b034068a40eef43cb51b079cc6f0555" --force-reinstall
+
+### Install the AIAK custom ops library
+
+```bash
+uv pip install "http://vllm-ai-models.bj.bcebos.com/XSpeedGate-whl/release_merge/20260228_173659/xspeedgate_ops-1.0.0+04b2a8c-cp310-cp310-linux_x86_64.whl" --force-reinstall
 ```
 
+### Install the Pod custom ops library
+
+```bash
+uv pip install "https://vllm-ai-models.bj.bcebos.com/link/20260228_163304/cocopod-1.0.0-cp310-cp310-linux_x86_64.whl"
+```
+
+## Latest ops list
+
+You can follow this document for updates to get the latest information.
+[vLLM-Kunlun Ops Update List](https://docs.google.com/document/d/1r_Eos0UvBqHBYmoVa4nwIK0oKQH35Tde8oGowvX2znc/edit?usp=sharing)
 
 ## Quick Start
 
 ### Set up the environment
 
-```
+```bash
 chmod +x /workspace/vLLM-Kunlun/setup_env.sh && source /workspace/vLLM-Kunlun/setup_env.sh
 ```
 
 ### Run the server
+
 :::::{tab-set}
 :sync-group: install
 
 ::::{tab-item} start_service.sh
 :selected:
 :sync: pip
+
 ```{code-block} bash
 python -m vllm.entrypoints.openai.api_server \
       --host 0.0.0.0 \
@@ -173,5 +176,6 @@ python -m vllm.entrypoints.openai.api_server \
                                                 "vllm.sparse_attn_indexer"]}'
 
 ```
+
 ::::
 :::::
