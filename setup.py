@@ -4,6 +4,7 @@
 
 import os
 import shutil
+import sys
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import CppExtension, BuildExtension
 
@@ -37,6 +38,14 @@ class CustomBuildExt(BuildExtension):
 
 
 if __name__ == '__main__':
+    if "--build" in sys.argv:
+        sys.argv = [arg for arg in sys.argv if arg != "--build"]
+        if "build" not in sys.argv[1:]:
+            sys.argv.insert(1, "build")
+    if "--install" in sys.argv:
+        sys.argv = [arg for arg in sys.argv if arg != "--install"]
+        if "install" not in sys.argv[1:]:
+            sys.argv.append("install")
 
     setup(
         name='vllm_kunlun',

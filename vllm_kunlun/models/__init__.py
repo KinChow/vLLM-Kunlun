@@ -9,6 +9,7 @@ def register_model():
     from .qwen3_omni_moe_thinker import (  # noqa: F401
         Qwen3OmniMoeThinkerForConditionalGeneration,
     )
+    from .kimi_k25 import KimiK25ForConditionalGeneration  # noqa: F401
     from .qwen3_vl import Qwen3VLForConditionalGeneration  # noqa: F401
     from .qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration  # noqa: F401
 
@@ -64,6 +65,16 @@ def register_model():
     ModelRegistry.register_model(
         "InternS1ForConditionalGeneration",
         "vllm_kunlun.models.interns1:InternS1ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "KimiK25ForConditionalGeneration",
+        "vllm_kunlun.models.kimi_k25:KimiK25ForConditionalGeneration",
+    )
+
+    ModelRegistry.register_model(
+        "KimiK2_5ForConditionalGeneration",
+        "vllm_kunlun.models.kimi_k25:KimiK25ForConditionalGeneration",
     )
 
     ModelRegistry.register_model(
