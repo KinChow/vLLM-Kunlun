@@ -1218,8 +1218,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         attn_out = torch.empty_like(q)
         ds_alpha = 1.8738542070926265
         tp_q_head_num=q.size(1)
-        softmax_lse = torch.zeros(tp_q_head_num, q.size(0), dtype=torch.float32, device=q.device)
-        softmax_lse.fill_(float('-inf'))
+        softmax_lse = torch.full((tp_q_head_num, q.size(0)), float('-inf'), dtype=torch.float32, device=q.device)
         kunlun_ops.attention(
             q=q,
             k_cache=k,
