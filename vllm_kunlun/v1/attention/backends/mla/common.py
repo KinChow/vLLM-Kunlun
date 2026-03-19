@@ -1226,19 +1226,11 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             v_cache=maybe_padded_v,
             out=attn_out,
             is_causal=causal,
-            is_prefill=True,
-            prefill_len=0,
-            k_perchannel_scale=None,
-            v_perchannel_scale=None,
-            smooth=None,
             context_seq_lod_cpu=context_seq_lod_cpu,
             context_seq_lod_xpu=context_seq_lod_xpu,
-            slot_mapping_cpu=None,
-            slot_mapping_xpu=None,
-            v_trans=False,
-            v_trans_threshold=0,
             alpha=ds_alpha,
-            softmax_lse=softmax_lse
+            softmax_lse=softmax_lse,
+            unpadded_lse=True,
         )
 
         # Unpack the output if there is multiple results
@@ -1312,7 +1304,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             k=k,
             v=v,
             context_seq_lod_xpu=prefill.query_start_loc,
-            context_seq_lod_cpu=prefill.chunked_context.cu_seq_lens_cpu[chunk_idx],
+            context_seq_lod_cpu=prefill.query_start_loc_cpu,
             softmax_scale=self.scale,
             causal=False,
             return_softmax_lse=True,
@@ -1745,7 +1737,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                     q, kv_c_and_k_pe_cache, attn_metadata, k_scale)
 
             output = torch.empty_like(suffix_output)
-            output_lse = torch.empty_like(output)
+            output_lse = torch.empty_like(suffix_lse)
             merge_attn_states(
                 output=output,
                 prefix_output=context_output,
