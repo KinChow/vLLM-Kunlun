@@ -477,6 +477,25 @@ class DeepseekV2Attention(nn.Module):
         return output
 
 
+_TOPK_EPSILON_CACHE: dict = {}
+
+
+def _get_topk_epsilon(
+    max_model_len: int, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    """Pre-compute and cache position-based epsilon for topk tie-breaking.
+
+    Formula: eps[col] = (max_model_len - col) * 2e-6
+    Ensures all logit values are unique after addition, making topk deterministic.
+    The tensor is shaped [1, max_model_len] for broadcasting over [B, L] logits.
+    """
+    key = (max_model_len, device, dtype)
+    if key not in _TOPK_EPSILON_CACHE:
+        col = torch.arange(max_model_len, device=device, dtype=dtype)
+        _TOPK_EPSILON_CACHE[key] = ((max_model_len - col) * 2e-6).unsqueeze(0)
+    return _TOPK_EPSILON_CACHE[key]
+
+
 @custom_op("vllm::sparse_attn_indexer_vllm_kunlun", mutates_args=())
 def sparse_attn_indexer_vllm_kunlun(
     hidden_states: torch.Tensor,
@@ -558,24 +577,42 @@ def sparse_attn_indexer_vllm_kunlun(
             del k_fp8, k_scale
 
             num_rows = logits.shape[0]
+            if num_rows == 0:
+                continue
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
 
-            # when seqLens=None and next_n=None, it means that it is used to calculate topk_indices in prefill
-            # refer to top_k_per_row_prefill：https://github.com/vllm-project/vllm/blob/6a09612b2e0e09d037a220ea8115632b8084e008/csrc/sampler.cu#L698
-            torch.ops.xspeedgate_ops.topk_per_row(
-                logits=logits,
-                srcIndices=topk_indices,
-                numRows=num_rows,
-                stride0=logits.stride(0),
-                stride1=logits.stride(1),
-                topK=topk_tokens,
-                rowStarts=chunk.cu_seqlen_ks,
-                rowEnds=chunk.cu_seqlen_ke,
-                seqLens=None,
-                next_n=None,
+            # Mask positions outside each token's causal visible range
+            # [cu_seqlen_ks[i], cu_seqlen_ke[i]).  int8_mqa_logits does not
+            # guarantee -inf for out-of-range columns, so explicit masking is
+            # required.  cu_seqlen_ks/ke are [N_q] GPU int32 tensors (per token,
+            # not per request).
+            L = logits.shape[1]
+            positions = torch.arange(L, device=logits.device).unsqueeze(0)
+            row_starts = chunk.cu_seqlen_ks.unsqueeze(1)
+            row_ends = chunk.cu_seqlen_ke.unsqueeze(1)
+            logits = logits.masked_fill(
+                (positions < row_starts) | (positions >= row_ends), float("-inf")
             )
+
+            # Epsilon disturbance for deterministic tie-breaking (INT8
+            # quantization creates many equal logit values; epsilon makes each
+            # column unique).  Adding after masking is safe: -inf + finite =
+            # -inf, so masked positions are unaffected.
+            logits.add_(
+                _get_topk_epsilon(max_model_len, logits.device, logits.dtype)[:, :L]
+            )
+
+            # Guard: when context is shorter than topk_tokens (e.g. first
+            # prefill of a very short sequence), torch.topk requires k <= L.
+            # Clamp k to L and zero-fill the unused trailing slots so the
+            # downstream sparse-attention kernel sees valid (harmless) indices.
+            actual_k = min(topk_tokens, L)
+            selected = logits.topk(actual_k, dim=-1)[1].to(torch.int32)
+            if actual_k < topk_tokens:
+                topk_indices.zero_()
+            topk_indices[:, :actual_k].copy_(selected)
 
     if has_decode:
         decode_metadata = attn_metadata.decode
@@ -600,6 +637,8 @@ def sparse_attn_indexer_vllm_kunlun(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
+        # padded_q_fp8_decode_tokens = padded_q_fp8_decode_tokens.contiguous()
+
         logits = int8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
@@ -614,20 +653,24 @@ def sparse_attn_indexer_vllm_kunlun(
         num_rows = logits.shape[0]
         topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
 
-        # when row_starts=None and row_ends=None, it means that it is used to calculate topk_indices in decode
-        # refer to top_k_per_row_decode：https://github.com/vllm-project/vllm/blob/6a09612b2e0e09d037a220ea8115632b8084e008/csrc/sampler.cu#L643
-        torch.ops.xspeedgate_ops.topk_per_row(
-            logits=logits,
-            srcIndices=topk_indices,
-            numRows=num_rows,
-            stride0=logits.stride(0),
-            stride1=logits.stride(1),
-            topK=topk_tokens,
-            rowStarts=None,
-            rowEnds=None,
-            seqLens=decode_metadata.seq_lens,
-            next_n=next_n,
+        # Mask invalid positions on GPU then use torch.topk — no CPU transfer.
+        # I8_paged_mqa_logits fills positions >= context_len with 0 (not -inf);
+        # explicit masking is required before topk.
+        # next_n-aware: speculative token at offset k (0-indexed) within a
+        # group of next_n attends to positions [0, seq_len - next_n + k].
+        positions = torch.arange(max_model_len, device=logits.device).expand(
+            num_padded_tokens, -1
         )
+        row_idx = torch.arange(num_padded_tokens, device=logits.device) // next_n
+        n_offset = torch.arange(num_padded_tokens, device=logits.device) % next_n
+        index_end = (decode_metadata.seq_lens[row_idx] - next_n + n_offset).unsqueeze(1)
+        logits = logits.masked_fill(positions > index_end, float("-inf"))
+
+        # Epsilon disturbance for deterministic tie-breaking (INT8 quantization
+        # creates many equal logit values; epsilon makes each column unique).
+        logits.add_(_get_topk_epsilon(max_model_len, logits.device, logits.dtype))
+
+        topk_indices.copy_(logits.topk(topk_tokens, dim=-1)[1].to(torch.int32))
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -751,7 +794,7 @@ class Indexer(nn.Module):
 
         q_pe, k_pe = rotary_emb(positions, q_pe, k_pe.unsqueeze(1))
         q = torch.cat([q_pe, q_nope], dim=-1)
-        k = torch.cat([k_pe.squeeze(1), k_nope], dim=-1)
+        k = torch.cat([k_pe.squeeze(-2), k_nope], dim=-1)
 
         # we only quant q here since k quant is fused with cache insertion
         q = q.view(-1, self.head_dim)
