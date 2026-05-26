@@ -1,5 +1,5 @@
-# MLA mixed batch benchmark (prefill + decode)
-# Tests chunked prefill performance
+# MLA mixed batch benchmark (Kunlun)
+# Tests chunked prefill performance with mixed prefill + decode batches.
 
 model:
   name: "deepseek-v3"
@@ -11,7 +11,7 @@ model:
   qk_nope_head_dim: 128
   qk_rope_head_dim: 64
   v_head_dim: 128
-  block_size: 128
+  block_size: 64    # Kunlun hardware constraint
 
 batch_specs:
   # Small prefill + decode
@@ -35,9 +35,9 @@ batch_specs:
   - "2q1ks8k_32q1s2k"       # 2 large extend + 32 decode
 
   # Explicitly chunked prefill
-  - "q8k"           # 8k prefill with chunking hint
-  - "q16k"          # 16k prefill with chunking hint
-  - "2q8k_32q1s2k"    # 2 chunked prefill + 32 decode
+  - "q8k"                   # 8k prefill with chunking hint
+  - "q16k"                  # 16k prefill with chunking hint
+  - "2q8k_32q1s2k"          # 2 chunked prefill + 32 decode
 
   # High decode ratio (realistic serving)
   - "1q2k_63q1s1k"          # 1 prefill + 63 decode
@@ -45,15 +45,13 @@ batch_specs:
   - "4q4k_60q1s4k"          # 4 prefill + 60 decode
 
 backends:
-  - CUTLASS_MLA
-  - FLASHINFER_MLA
-  - FLASH_ATTN_MLA   # Hopper only
-  - FLASHMLA         # Hopper only
+  - KUNLUN_FLASHMLA
 
 device: "cuda:0"
 repeats: 5
 warmup_iters: 3
 profile_memory: true
+cuda_graphs: true
 
 # Analyze chunked prefill workspace size impact
 chunked_prefill:

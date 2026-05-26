@@ -1,20 +1,13 @@
-# MLA prefill backend comparison
+# MLA prefill benchmark configuration (Kunlun)
 #
-# Compares all available MLA prefill backends:
-#   FA backends:  fa2, fa3, fa4 (FlashAttention versions)
-#   Non-FA:       flashinfer, cudnn, trtllm (Blackwell-only, require flashinfer)
-#   CuTe DSL:     tokenspeed (Blackwell + R1 dims, requires tokenspeed_mla)
-#
-# Uses cutlass_mla as the decode backend for impl construction
-# (only the prefill path is exercised).
-#
-# Backends that aren't available on the current platform will report errors
-# in the results table (e.g., fa3 on Blackwell, cudnn without artifactory).
+# Kunlun's MLA backend is unified (does not distinguish prefill/decode backends),
+# so a single `backends:` field is used here in place of the upstream
+# prefill_backends/decode_backends split.
 #
 # Usage:
 #   python benchmark.py --config configs/mla_prefill.yaml
 
-description: "MLA prefill backend comparison"
+description: "MLA prefill backend (Kunlun)"
 
 model:
   name: "deepseek-v3"
@@ -26,19 +19,7 @@ model:
   qk_nope_head_dim: 128
   qk_rope_head_dim: 64
   v_head_dim: 128
-  block_size: 128
-
-# model:
-#   name: "deepseek-v2-lite"
-#   num_layers: 27
-#   num_q_heads: 16
-#   num_kv_heads: 1
-#   head_dim: 576
-#   kv_lora_rank: 512
-#   qk_nope_head_dim: 128
-#   qk_rope_head_dim: 64
-#   v_head_dim: 128
-#   block_size: 128
+  block_size: 64    # Kunlun hardware constraint
 
 batch_specs:
   # Pure prefill
@@ -111,18 +92,10 @@ batch_specs:
   - "2q1ks64k"
   - "2q2ks64k"
 
-decode_backends:
-  - CUTLASS_MLA
-
-prefill_backends:
-  - fa2
-  - fa3
-  - fa4
-  - flashinfer
-  - cudnn
-  - trtllm
-  - tokenspeed
+backends:
+  - KUNLUN_FLASHMLA
 
 device: "cuda:0"
 repeats: 20
 warmup_iters: 5
+cuda_graphs: true

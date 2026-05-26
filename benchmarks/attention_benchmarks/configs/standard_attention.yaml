@@ -1,4 +1,4 @@
-# Standard attention backend benchmark configuration
+# Standard attention backend benchmark configuration (Kunlun)
 
 model:
   num_layers: 32
@@ -36,11 +36,9 @@ batch_specs:
   - "q1ks2k"          # 1k query, 2k sequence
   - "2q1ks4k"         # 2 requests: 1k query, 4k sequence
 
-# Available backends: FLASH_ATTN, TRITON_ATTN, FLASHINFER
+# vLLM-Kunlun custom attention backend adapter.
 backends:
-  - FLASH_ATTN
-  - TRITON_ATTN
-  - FLASHINFER
+  - KUNLUN_ATTN
 
 device: "cuda:0"
 repeats: 5

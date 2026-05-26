@@ -1,17 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-MLA benchmark runner - shared utilities for MLA benchmarks.
+"""Kunlun MLA benchmark runner."""
 
-This module provides helpers for running MLA backends without
-needing full VllmConfig integration.
-"""
+import time
 
 import numpy as np
 import torch
+
 from batch_spec import parse_batch_spec
 from common import (
+    ACCELERATOR,
     BenchmarkResult,
     MockHfConfig,
     MockIndexer,
@@ -23,13 +22,13 @@ from common import (
 from vllm.config import (
     CacheConfig,
     CompilationConfig,
+    DeviceConfig,
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
     VllmConfig,
     set_current_vllm_config,
 )
-from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 
 # ============================================================================
 # VllmConfig Creation
@@ -57,6 +56,123 @@ def _add_mock_methods_to_model_config(model_config: ModelConfig) -> None:
     )
 
 
+def _ensure_vllm_env_compat() -> None:
+    # vLLM-Kunlun v0.15.1 still reads a few v0.11-style paths while the
+    # installed vLLM moved them under vllm.v1. Register process-local aliases
+    # only for missing modules so older v0.11.0 real modules keep working.
+    import importlib
+    import os
+    import sys
+    import types
+
+    import vllm.envs as envs
+
+    if not hasattr(envs, "VLLM_ATTENTION_BACKEND"):
+        envs.VLLM_ATTENTION_BACKEND = os.environ.get("VLLM_ATTENTION_BACKEND")
+    if not hasattr(envs, "VLLM_DISABLE_FLASHINFER_PREFILL"):
+        envs.VLLM_DISABLE_FLASHINFER_PREFILL = bool(
+            int(os.environ.get("VLLM_DISABLE_FLASHINFER_PREFILL", "0"))
+        )
+    if not hasattr(envs, "VLLM_USE_FLASHINFER_MLA"):
+        envs.VLLM_USE_FLASHINFER_MLA = bool(
+            int(os.environ.get("VLLM_USE_FLASHINFER_MLA", "0"))
+        )
+
+    try:
+        import vllm.utils as vllm_utils
+        if not hasattr(vllm_utils, "cdiv"):
+            vllm_utils.cdiv = lambda a, b: -(-a // b)
+        if not hasattr(vllm_utils, "round_down"):
+            vllm_utils.round_down = lambda x, y: (x // y) * y
+    except ModuleNotFoundError:
+        pass
+
+    def import_or_package(name: str):
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            module = sys.modules.setdefault(name, types.ModuleType(name))
+            if not hasattr(module, "__path__"):
+                module.__path__ = []
+            parent_name, attr = name.rsplit(".", 1)
+            parent = sys.modules.get(parent_name)
+            if parent is not None:
+                setattr(parent, attr, module)
+            return module
+
+    attention_pkg = import_or_package("vllm.attention")
+    backends_pkg = import_or_package("vllm.attention.backends")
+    ops_pkg = import_or_package("vllm.attention.ops")
+    utils_pkg = import_or_package("vllm.attention.utils")
+    setattr(attention_pkg, "backends", backends_pkg)
+    setattr(attention_pkg, "ops", ops_pkg)
+    setattr(attention_pkg, "utils", utils_pkg)
+
+    aliases = {
+        "vllm.attention.backends.abstract": "vllm.v1.attention.backend",
+        "vllm.attention.ops.common": "vllm.v1.attention.ops.common",
+        "vllm.attention.ops.merge_attn_states": "vllm.v1.attention.ops.merge_attn_states",
+        "vllm.attention.utils.fa_utils": "vllm.v1.attention.backends.fa_utils",
+        "vllm.attention.ops.flashmla": "vllm.v1.attention.ops.flashmla",
+    }
+    for old_name, new_name in aliases.items():
+        try:
+            module = importlib.import_module(old_name)
+        except ModuleNotFoundError:
+            try:
+                module = importlib.import_module(new_name)
+            except ModuleNotFoundError:
+                continue
+            sys.modules[old_name] = module
+        parent_name, attr = old_name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, attr, module)
+
+    try:
+        backend_utils = importlib.import_module("vllm.attention.backends.utils")
+    except ModuleNotFoundError:
+        backend_utils = sys.modules.setdefault(
+            "vllm.attention.backends.utils",
+            types.ModuleType("vllm.attention.backends.utils"),
+        )
+        setattr(backends_pkg, "utils", backend_utils)
+    try:
+        v1_backend_utils = importlib.import_module("vllm.v1.attention.backends.utils")
+        try:
+            v1_backend = importlib.import_module("vllm.v1.attention.backend")
+            for moved_name in (
+                "AttentionBackend",
+                "AttentionCGSupport",
+                "AttentionLayer",
+                "AttentionMetadata",
+                "AttentionMetadataBuilder",
+                "AttentionType",
+                "MLAAttentionImpl",
+            ):
+                if not hasattr(v1_backend_utils, moved_name) and hasattr(v1_backend, moved_name):
+                    setattr(v1_backend_utils, moved_name, getattr(v1_backend, moved_name))
+        except ModuleNotFoundError:
+            pass
+        for name in dir(v1_backend_utils):
+            if not name.startswith("__") and not hasattr(backend_utils, name):
+                setattr(backend_utils, name, getattr(v1_backend_utils, name))
+    except ModuleNotFoundError:
+        pass
+    try:
+        mla_attention = importlib.import_module("vllm.model_executor.layers.attention.mla_attention")
+        if not hasattr(backend_utils, "get_mla_dims"):
+            backend_utils.get_mla_dims = mla_attention.get_mla_dims
+    except (ModuleNotFoundError, AttributeError):
+        pass
+    setattr(backends_pkg, "utils", backend_utils)
+
+    flashmla_ops = sys.modules.get("vllm.attention.ops.flashmla")
+    if flashmla_ops is not None and not hasattr(flashmla_ops, "is_flashmla_supported"):
+        if hasattr(flashmla_ops, "is_flashmla_dense_supported"):
+            flashmla_ops.is_flashmla_supported = flashmla_ops.is_flashmla_dense_supported
+
+
 def create_minimal_vllm_config(
     model_name: str = "deepseek-v3",
     block_size: int = 128,
@@ -64,7 +180,6 @@ def create_minimal_vllm_config(
     max_num_batched_tokens: int = 8192,
     mla_dims: dict | None = None,
     index_topk: int | None = None,
-    prefill_backend: str | None = None,
     kv_cache_dtype: str = "auto",
 ) -> VllmConfig:
     """
@@ -79,13 +194,12 @@ def create_minimal_vllm_config(
                   setup_mla_dims(model_name)
         index_topk: Optional topk value for sparse MLA backends. If provided,
                     the config will include index_topk for sparse attention.
-        prefill_backend: Prefill backend name (e.g., "fa3", "fa4", "flashinfer",
-                        "trtllm"). Configures the attention config to force
-                        the specified prefill backend.
 
     Returns:
         VllmConfig for benchmarking
     """
+    _ensure_vllm_env_compat()
+
     # Get MLA dimensions - use provided or load from model name
     if mla_dims is None:
         mla_dims = setup_mla_dims(model_name)
@@ -169,71 +283,18 @@ def create_minimal_vllm_config(
     )
 
     compilation_config = CompilationConfig()
+    device_config = DeviceConfig(device="cuda")
 
     vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=cache_config,
         parallel_config=parallel_config,
         scheduler_config=scheduler_config,
+        device_config=device_config,
         compilation_config=compilation_config,
     )
 
-    if prefill_backend is not None:
-        prefill_cfg = get_prefill_backend_config(prefill_backend)
-        vllm_config.attention_config.mla_prefill_backend = prefill_cfg[
-            "mla_prefill_backend"
-        ]
-        if prefill_cfg["flash_attn_version"] is not None:
-            vllm_config.attention_config.flash_attn_version = prefill_cfg[
-                "flash_attn_version"
-            ]
-
     return vllm_config
-
-
-# ============================================================================
-# Prefill Backend Configuration
-# ============================================================================
-
-# Maps prefill backend names to attention config overrides.
-# FA backends set flash_attn_version and disable non-FA paths.
-# Non-FA backends enable their specific path and disable others.
-_PREFILL_BACKEND_CONFIG: dict[str, dict] = {
-    "fa2": {
-        "flash_attn_version": 2,
-        "mla_prefill_backend": MLAPrefillBackendEnum.FLASH_ATTN,
-    },
-    "fa3": {
-        "flash_attn_version": 3,
-        "mla_prefill_backend": MLAPrefillBackendEnum.FLASH_ATTN,
-    },
-    "fa4": {
-        "flash_attn_version": 4,
-        "mla_prefill_backend": MLAPrefillBackendEnum.FLASH_ATTN,
-    },
-    "flashinfer": {
-        "flash_attn_version": None,
-        "mla_prefill_backend": MLAPrefillBackendEnum.FLASHINFER,
-    },
-    "trtllm": {
-        "flash_attn_version": None,
-        "mla_prefill_backend": MLAPrefillBackendEnum.TRTLLM_RAGGED,
-    },
-    "tokenspeed": {
-        "flash_attn_version": None,
-        "mla_prefill_backend": MLAPrefillBackendEnum.TOKENSPEED_MLA,
-    },
-}
-
-
-def get_prefill_backend_config(prefill_backend: str) -> dict:
-    """Get attention config overrides for a prefill backend."""
-    if prefill_backend not in _PREFILL_BACKEND_CONFIG:
-        raise ValueError(
-            f"Unknown prefill backend: {prefill_backend!r}. "
-            f"Available: {list(_PREFILL_BACKEND_CONFIG.keys())}"
-        )
-    return _PREFILL_BACKEND_CONFIG[prefill_backend]
 
 
 # ============================================================================
@@ -241,64 +302,138 @@ def get_prefill_backend_config(prefill_backend: str) -> dict:
 # ============================================================================
 
 
-# Backend-specific properties that can't be inferred from the backend class
-# Keys are AttentionBackendEnum names (uppercase)
-_BACKEND_PROPERTIES = {
-    "FLASHMLA": {
-        "query_format": "concat",  # Single concatenated tensor (vs tuple)
-    },
-    "FLASHMLA_SPARSE": {
-        "query_format": "concat",  # Single concatenated tensor (vs tuple)
-    },
+# vLLM-Kunlun MLA aliases used by the adapted benchmark.
+_KUNLUN_MLA_ALIASES = {
+    "KUNLUN_FLASHMLA": (
+        "vllm_kunlun.v1.attention.backends.mla.flashmla",
+        "FlashMLABackend",
+        False,
+    ),
+    "KUNLUN_FLASHMLA_SPARSE": (
+        "vllm_kunlun.v1.attention.backends.mla.flashmla_sparse",
+        "FlashMLASparseBackend",
+        True,
+    ),
 }
 
 
-def _get_backend_config(backend: str) -> dict:
+def _load_kunlun_mla_backend(backend: str):
+    import importlib
+
+    module_name, class_name, is_sparse = _KUNLUN_MLA_ALIASES[backend]
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError:
+        # v0.15.1 packages currently ship Kunlun MLA files that import old
+        # vllm.attention.backends paths. Fall back to the vLLM v1 MLA class;
+        # vLLM-Kunlun import hooks still patch the native ops underneath.
+        fallback_module = module_name.replace("vllm_kunlun.", "vllm.")
+        module = importlib.import_module(fallback_module)
+    _patch_kunlun_merge_attn_states()
+    return getattr(module, class_name), is_sparse
+
+
+def _patch_kunlun_merge_attn_states() -> None:
+    """Force Kunlun MLA chunked prefill to use Kunlun merge-attn op.
+
+    vLLM's default merge_attn_states implementation falls back to a Triton CUDA
+    kernel on non-CUDA platforms. P800 containers do not provide NVIDIA
+    libcuda.so, so Kunlun MLA chunked prefill must bind to the Kunlun
+    attention_merge_stage wrapper instead.
     """
-    Get backend configuration from AttentionBackendEnum.
-
-    Uses the registry to get the backend class and extract configuration
-    from its methods (get_impl_cls, get_builder_cls, is_sparse, etc.).
-
-    Args:
-        backend: Backend name matching AttentionBackendEnum exactly
-        (e.g., "FLASHMLA_SPARSE")
-
-    Returns:
-        Dict with backend configuration
-    """
-    from vllm.v1.attention.backend import MultipleOf
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    import importlib
+    import sys
 
     try:
-        backend_enum = AttentionBackendEnum[backend]
-        backend_class = backend_enum.get_class()
-    except (KeyError, ValueError) as e:
-        valid_backends = [e.name for e in AttentionBackendEnum if e.name != "CUSTOM"]
-        raise ValueError(
-            f"Unknown backend: {backend}. "
-            f"Valid MLA backends: {[b for b in valid_backends if 'MLA' in b]}"
-        ) from e
+        kunlun_merge_mod = importlib.import_module(
+            "vllm_kunlun.ops.attention.merge_attn_states"
+        )
+    except ModuleNotFoundError:
+        return
 
-    # Get block size from backend class
-    block_sizes = backend_class.get_supported_kernel_block_sizes()
-    # Use first supported block size (backends typically support one for MLA)
-    block_size = block_sizes[0] if block_sizes else None
-    if isinstance(block_size, MultipleOf):
-        # No fixed block size; fall back to config value
+    def merge_attn_states(
+        output,
+        prefix_output,
+        prefix_lse,
+        suffix_output,
+        suffix_lse,
+        output_lse=None,
+        prefill_tokens_with_context=None,
+        output_scale=None,
+    ):
+        if output_scale is not None:
+            raise NotImplementedError(
+                "Kunlun benchmark merge_attn_states patch does not support "
+                "output_scale."
+            )
+        if (
+            prefill_tokens_with_context is not None
+            and prefill_tokens_with_context != output.shape[0]
+        ):
+            raise NotImplementedError(
+                "Kunlun benchmark merge_attn_states patch only supports "
+                "merging all tokens."
+            )
+        return kunlun_merge_mod.merge_attn_states(
+            output,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+            output_lse,
+        )
+
+    for mod_name in (
+        "vllm_kunlun.v1.attention.backends.mla.common",
+        "vllm.v1.attention.backends.mla.common",
+        "vllm.attention.ops.merge_attn_states",
+        "vllm.v1.attention.ops.merge_attn_states",
+    ):
+        module = sys.modules.get(mod_name)
+        if module is not None:
+            module.merge_attn_states = merge_attn_states
+
+
+def _get_backend_config(backend: str) -> dict:
+    """Get Kunlun MLA backend configuration."""
+    _ensure_vllm_env_compat()
+
+    try:
+        from vllm.v1.attention.backend import MultipleOf
+    except ModuleNotFoundError:
+        MultipleOf = ()
+
+    backend_key = backend.upper()
+    if backend_key not in _KUNLUN_MLA_ALIASES:
+        raise ValueError(
+            f"Only Kunlun MLA backends are supported: "
+            f"{list(_KUNLUN_MLA_ALIASES)}. Got {backend!r}."
+        )
+    backend_class, forced_sparse = _load_kunlun_mla_backend(backend_key)
+
+    # Get block size from backend class when the installed vLLM exposes it.
+    # Older Kunlun MLA backends only provide the legacy kv-cache shape API, so
+    # we fall back to the YAML/config block_size in that case.
+    if hasattr(backend_class, "get_supported_kernel_block_sizes"):
+        block_sizes = backend_class.get_supported_kernel_block_sizes()
+        block_size = block_sizes[0] if block_sizes else None
+        if isinstance(block_size, MultipleOf):
+            block_size = None
+    else:
         block_size = None
 
     # Check if sparse via class method if available
-    is_sparse = getattr(backend_class, "is_sparse", lambda: False)()
-
-    # Get properties that can't be inferred
-    props = _BACKEND_PROPERTIES.get(backend, {})
+    is_sparse = (
+        forced_sparse
+        if forced_sparse is not None
+        else getattr(backend_class, "is_sparse", lambda: False)()
+    )
 
     return {
         "backend_class": backend_class,
         "impl_class": backend_class.get_impl_cls(),
         "builder_class": backend_class.get_builder_cls(),
-        "query_format": props.get("query_format", "tuple"),
+        "query_format": "tuple",
         "block_size": block_size,
         "is_sparse": is_sparse,
     }
@@ -379,21 +514,35 @@ def _build_attention_metadata(
     # Create CommonAttentionMetadata
     from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 
-    common_attn_metadata = CommonAttentionMetadata(
-        num_reqs=len(requests),
-        max_query_len=max(q_lens),
-        max_seq_len=max_kv,
-        num_actual_tokens=total_q,
-        query_start_loc=q_start_gpu,
-        query_start_loc_cpu=q_start_cpu,
-        seq_lens=seq_lens_gpu,
-        seq_lens_cpu_upper_bound=seq_lens_cpu,
-        _seq_lens_cpu=seq_lens_cpu,
-        _num_computed_tokens_cpu=num_computed_tokens_cpu,
-        slot_mapping=slot_mapping,
-        block_table_tensor=block_table_gpu,
-        dcp_local_seq_lens=None,
-    )
+    common_kwargs = {
+        "num_reqs": len(requests),
+        "max_query_len": max(q_lens),
+        "max_seq_len": max_kv,
+        "num_actual_tokens": total_q,
+        "query_start_loc": q_start_gpu,
+        "query_start_loc_cpu": q_start_cpu,
+        "seq_lens": seq_lens_gpu,
+        "slot_mapping": slot_mapping,
+        "block_table_tensor": block_table_gpu,
+    }
+
+    common_fields = getattr(CommonAttentionMetadata, "__dataclass_fields__", {})
+    if "seq_lens_cpu_upper_bound" in common_fields:
+        common_kwargs["seq_lens_cpu_upper_bound"] = seq_lens_cpu
+    if "seq_lens_cpu" in common_fields:
+        common_kwargs["seq_lens_cpu"] = seq_lens_cpu
+    elif "_seq_lens_cpu" in common_fields:
+        common_kwargs["_seq_lens_cpu"] = seq_lens_cpu
+    if "num_computed_tokens_cpu" in common_fields:
+        common_kwargs["num_computed_tokens_cpu"] = num_computed_tokens_cpu
+    elif "_num_computed_tokens_cpu" in common_fields:
+        common_kwargs["_num_computed_tokens_cpu"] = num_computed_tokens_cpu
+    if "dcp_local_seq_lens" in common_fields:
+        common_kwargs["dcp_local_seq_lens"] = None
+    if "dcp_local_seq_lens_cpu" in common_fields:
+        common_kwargs["dcp_local_seq_lens_cpu"] = None
+
+    common_attn_metadata = CommonAttentionMetadata(**common_kwargs)
 
     # Use the production build() method
     metadata = builder_instance.build(
@@ -549,6 +698,8 @@ def _create_backend_impl(
         num_heads=mla_dims["num_q_heads"],
         qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
         v_head_dim=mla_dims["v_head_dim"],
+        kv_lora_rank=mla_dims["kv_lora_rank"],
+        device=device,
     )
 
     # Create indexer for sparse backends
@@ -590,6 +741,12 @@ def _create_backend_impl(
     # Create impl
     impl = impl_class(**impl_kwargs)
 
+    # Initialize derived MLA projection weights that are normally prepared
+    # after model weight loading. The benchmark uses MockKVBProj, so it has
+    # to trigger this step explicitly for decode paths.
+    if hasattr(impl, "process_weights_after_loading"):
+        impl.process_weights_after_loading(torch.bfloat16)
+
     # Initialize DCP attributes
     if not hasattr(impl, "dcp_world_size") or impl.dcp_world_size in (None, -1):
         impl.dcp_world_size = 1
@@ -608,20 +765,25 @@ def _create_backend_impl(
     # Create mock layer
     layer = MockLayer(device, impl=impl, kv_cache_spec=kv_cache_spec)
 
-    # Attach a prefill backend (MLAAttention does this in __init__; the metadata
-    # builder reads layer.prefill_backend from static_forward_context).
-    from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+    # Newer vLLM MLA builders expect MLAAttention to attach a separate
+    # prefill backend to the layer. Older Kunlun MLA implementations keep
+    # prefill/decode inside MLACommonImpl and do not ship this helper package.
+    try:
+        from vllm.v1.attention.backends.mla.prefill import get_mla_prefill_backend
+    except ModuleNotFoundError:
+        get_mla_prefill_backend = None
 
-    prefill_backend_cls = get_mla_prefill_backend(vllm_config)
-    layer.prefill_backend = prefill_backend_cls(
-        num_heads=mla_dims["num_q_heads"],
-        scale=(mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"]) ** -0.5,
-        kv_lora_rank=mla_dims["kv_lora_rank"],
-        qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
-        qk_rope_head_dim=mla_dims["qk_rope_head_dim"],
-        v_head_dim=mla_dims["v_head_dim"],
-        vllm_config=vllm_config,
-    )
+    if get_mla_prefill_backend is not None:
+        prefill_backend_cls = get_mla_prefill_backend(vllm_config)
+        layer.prefill_backend = prefill_backend_cls(
+            num_heads=mla_dims["num_q_heads"],
+            scale=(mla_dims["qk_nope_head_dim"] + mla_dims["qk_rope_head_dim"]) ** -0.5,
+            kv_lora_rank=mla_dims["kv_lora_rank"],
+            qk_nope_head_dim=mla_dims["qk_nope_head_dim"],
+            qk_rope_head_dim=mla_dims["qk_rope_head_dim"],
+            v_head_dim=mla_dims["v_head_dim"],
+            vllm_config=vllm_config,
+        )
 
     # Create builder instance if needed
     builder_instance = None
@@ -792,7 +954,8 @@ def _run_single_benchmark(
     )
     num_prefill = total_q - num_decode
 
-    # Some backends requires fp8 queries when using fp8 KV cache.
+    # Some Kunlun sparse MLA implementations require fp8 queries when using
+    # fp8 KV cache.
     is_fp8_kvcache = kv_cache_dtype.startswith("fp8")
     quantize_query = is_fp8_kvcache and getattr(
         impl, "supports_quant_query_input", False
@@ -801,48 +964,76 @@ def _run_single_benchmark(
     # quantize_query forces concat format
     query_fmt = "concat" if quantize_query else backend_cfg["query_format"]
 
-    # Create decode query tensors
-    if has_decode:
-        decode_inputs, _ = _create_input_tensors(
-            num_decode, mla_dims, query_fmt, device, torch.bfloat16
+    # Create input tensors. Newer vLLM/MLA implementations expose one
+    # unified forward(layer, q, k_c_normed, k_pe, kv_cache, metadata, output).
+    # Older benchmark code split decode/prefill via forward_mqa/forward_mha.
+    unified_forward = not (hasattr(impl, "forward_mqa") and hasattr(impl, "forward_mha"))
+    if unified_forward:
+        _, all_inputs = _create_input_tensors(
+            total_q, mla_dims, "concat", device, torch.bfloat16
         )
-        # Cast decode query to fp8 if the backend supports it
+        q = all_inputs["q"]
+        k_c_normed = all_inputs["k_c_normed"]
+        k_pe = all_inputs["k_pe"]
+        output = all_inputs["output"]
         if quantize_query:
             from vllm.platforms import current_platform
 
-            if isinstance(decode_inputs, tuple):
-                decode_inputs = torch.cat(list(decode_inputs), dim=-1)
-            decode_inputs = decode_inputs.to(current_platform.fp8_dtype())
+            q = q.to(current_platform.fp8_dtype())
 
-    # Create prefill input tensors
-    if has_prefill:
-        _, prefill_inputs = _create_input_tensors(
-            num_prefill, mla_dims, query_fmt, device, torch.bfloat16
-        )
-
-    # Build forward function
-    def forward_fn():
-        results = []
-        if has_decode:
-            results.append(impl.forward_mqa(decode_inputs, kv_cache, metadata, layer))
-        if has_prefill:
-            results.append(
-                impl.forward_mha(
-                    prefill_inputs["q"],
-                    prefill_inputs["k_c_normed"],
-                    prefill_inputs["k_pe"],
-                    kv_cache,
-                    metadata,
-                    prefill_inputs["k_scale"],
-                    prefill_inputs["output"],
-                )
+        def forward_fn():
+            return impl.forward(
+                layer,
+                q,
+                k_c_normed,
+                k_pe,
+                kv_cache,
+                metadata,
+                output=output,
             )
-        return results[0] if len(results) == 1 else tuple(results)
+    else:
+        # Create decode query tensors
+        if has_decode:
+            decode_inputs, _ = _create_input_tensors(
+                num_decode, mla_dims, query_fmt, device, torch.bfloat16
+            )
+            # Cast decode query to fp8 if the backend supports it
+            if quantize_query:
+                from vllm.platforms import current_platform
+
+                if isinstance(decode_inputs, tuple):
+                    decode_inputs = torch.cat(list(decode_inputs), dim=-1)
+                decode_inputs = decode_inputs.to(current_platform.fp8_dtype())
+
+        # Create prefill input tensors
+        if has_prefill:
+            _, prefill_inputs = _create_input_tensors(
+                num_prefill, mla_dims, query_fmt, device, torch.bfloat16
+            )
+
+        # Build forward function
+        def forward_fn():
+            results = []
+            if has_decode:
+                results.append(impl.forward_mqa(decode_inputs, kv_cache, metadata, layer))
+            if has_prefill:
+                results.append(
+                    impl.forward_mha(
+                        prefill_inputs["q"],
+                        prefill_inputs["k_c_normed"],
+                        prefill_inputs["k_pe"],
+                        kv_cache,
+                        metadata,
+                        prefill_inputs["k_scale"],
+                        prefill_inputs["output"],
+                    )
+                )
+            return results[0] if len(results) == 1 else tuple(results)
 
     # Warmup
     for _ in range(config.warmup_iters):
         forward_fn()
-    torch.accelerator.synchronize()
+    ACCELERATOR.synchronize()
 
     # Optionally capture a CUDA graph after warmup.
     # Graph replay eliminates CPU launch overhead so timings reflect pure
@@ -858,17 +1049,13 @@ def _run_single_benchmark(
     # Benchmark
     times = []
     for _ in range(config.repeats):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
+        ACCELERATOR.synchronize()
+        start_time = time.perf_counter()
         for _ in range(config.num_layers):
             benchmark_fn()
-        end.record()
-
-        torch.accelerator.synchronize()
-        elapsed_ms = start.elapsed_time(end)
-        times.append(elapsed_ms / 1000.0 / config.num_layers)
+        ACCELERATOR.synchronize()
+        elapsed_s = time.perf_counter() - start_time
+        times.append(elapsed_s / config.num_layers)
 
     mean_time = float(np.mean(times))
     return BenchmarkResult(
@@ -883,27 +1070,20 @@ def _run_single_benchmark(
 
 def _run_mla_benchmark_batched(
     backend: str,
-    configs_with_params: list[tuple],  # [(config, threshold, num_splits), ...]
+    configs_with_params: list[tuple],  # [(config, threshold), ...]
     index_topk: int = 2048,
-    prefill_backend: str | None = None,
 ) -> list[BenchmarkResult]:
     """
-    Unified batched MLA benchmark runner for all backends.
-
-    Works for: flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-               flashinfer_mla_sparse, flashmla_sparse
+    Batched Kunlun MLA benchmark runner.
 
     This function reuses backend initialization across multiple benchmarks
     to avoid setup/teardown overhead.
 
     Args:
         backend: Backend name (decode backend used for impl construction)
-        configs_with_params: List of (config, threshold, num_splits) tuples
-            - threshold: reorder_batch_threshold (FlashAttn/FlashMLA only)
-            - num_splits: num_kv_splits (CUTLASS only)
+        configs_with_params: List of (config, threshold) tuples
+            - threshold: optional reorder_batch_threshold override
         index_topk: Topk value for sparse MLA backends (default 2048)
-        prefill_backend: Prefill backend name (e.g., "fa3", "fa4").
-            When set, forces the specified FlashAttention version for prefill.
 
     Returns:
         List of BenchmarkResult objects
@@ -913,7 +1093,7 @@ def _run_mla_benchmark_batched(
 
     backend_cfg = _get_backend_config(backend)
     device = torch.device(configs_with_params[0][0].device)
-    torch.accelerator.set_device_index(device)
+    ACCELERATOR.set_device_index(device)
 
     # Determine block size
     config_block_size = configs_with_params[0][0].block_size
@@ -930,12 +1110,14 @@ def _run_mla_benchmark_batched(
     # Determine if this is a sparse backend
     is_sparse = backend_cfg.get("is_sparse", False)
 
-    # Extract kv_cache_dtype from the first config
-    kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
+    # Extract kv_cache_dtype from the first config. Keep a vLLM-valid dtype
+    # for CacheConfig and use a separate internal layout marker for sparse MLA.
+    config_kv_cache_dtype = getattr(first_config, "kv_cache_dtype", "auto")
+    kv_cache_dtype = config_kv_cache_dtype
 
     # FlashMLA sparse only supports "fp8_ds_mla" internally (not generic "fp8").
     # Remap here so the user can pass --kv-cache-dtype fp8 regardless of backend.
-    if backend.upper() == "FLASHMLA_SPARSE" and kv_cache_dtype == "fp8":
+    if backend.upper() in ("FLASHMLA_SPARSE", "KUNLUN_FLASHMLA_SPARSE") and kv_cache_dtype == "fp8":
         kv_cache_dtype = "fp8_ds_mla"
 
     # Compute max total_q across all configs so the metadata builder buffer
@@ -952,8 +1134,7 @@ def _run_mla_benchmark_batched(
         max_num_batched_tokens=max_total_q,
         mla_dims=mla_dims,  # Use custom dims from config or default
         index_topk=index_topk if is_sparse else None,
-        prefill_backend=prefill_backend,
-        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_dtype=config_kv_cache_dtype,
     )
 
     results = []
@@ -970,49 +1151,12 @@ def _run_mla_benchmark_batched(
             kv_cache_dtype=kv_cache_dtype,
         )
 
-        # Verify the actual prefill backend matches what was requested. The
-        # selector + impl construction already raise on misuse; here we just
-        # check the resolved class against the requested name as a sanity guard.
-        if prefill_backend is not None:
-            expected_class = {
-                "fa2": "FlashAttnPrefillBackend",
-                "fa3": "FlashAttnPrefillBackend",
-                "fa4": "FlashAttnPrefillBackend",
-                "flashinfer": "FlashInferPrefillBackend",
-                "trtllm": "TrtllmRaggedPrefillBackend",
-                "tokenspeed": "TokenspeedMLAPrefillBackend",
-            }.get(prefill_backend)
-            actual_class = type(getattr(layer, "prefill_backend", None)).__name__
-            if expected_class and actual_class != expected_class:
-                raise RuntimeError(
-                    f"Prefill backend '{prefill_backend}' requested "
-                    f"{expected_class}, got {actual_class}. Check "
-                    f"attention_config plumbing or installed deps."
-                )
-            if prefill_backend in {"fa2", "fa3", "fa4"}:
-                fa_version = int(prefill_backend[2:])
-                actual_fa_version = getattr(
-                    layer.prefill_backend, "vllm_flash_attn_version", None
-                )
-                if actual_fa_version != fa_version:
-                    raise RuntimeError(
-                        f"Prefill backend '{prefill_backend}' requested FA "
-                        f"version {fa_version}, got "
-                        f"{actual_fa_version} on {actual_class}."
-                    )
         # Run each benchmark with the shared impl
-        for config, threshold, num_splits in configs_with_params:
-            # Set threshold for this benchmark (FlashAttn/FlashMLA only)
+        for config, threshold in configs_with_params:
             original_threshold = None
             if threshold is not None and builder_instance:
                 original_threshold = builder_instance.reorder_batch_threshold
                 builder_instance.reorder_batch_threshold = threshold
-
-            # Set num_splits for CUTLASS
-            original_num_splits = None
-            if num_splits is not None and hasattr(impl, "_num_kv_splits"):
-                original_num_splits = impl._num_kv_splits
-                impl._num_kv_splits = num_splits
 
             try:
                 result = _run_single_benchmark(
@@ -1033,10 +1177,6 @@ def _run_mla_benchmark_batched(
                 if original_threshold is not None:
                     builder_instance.reorder_batch_threshold = original_threshold
 
-                # Restore original num_splits
-                if original_num_splits is not None:
-                    impl._num_kv_splits = original_num_splits
-
     return results
 
 
@@ -1054,49 +1194,46 @@ def run_mla_benchmark(
     prefill_backend: str | None = None,
 ) -> BenchmarkResult | list[BenchmarkResult]:
     """
-    Unified MLA benchmark runner for all backends.
-
-    Works for: flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-               flashinfer_mla_sparse, flashmla_sparse
+    Kunlun MLA benchmark runner.
 
     Always uses batched execution internally for optimal performance.
 
     Args:
-        backend: Backend name (flashattn_mla, flashmla, flashinfer_mla, cutlass_mla,
-                 flashinfer_mla_sparse, flashmla_sparse)
+        backend: KUNLUN_FLASHMLA or KUNLUN_FLASHMLA_SPARSE
         config: BenchmarkConfig or list of (BenchmarkConfig, param) tuples
-        reorder_batch_threshold: Threshold override for FlashAttn/FlashMLA
-                                 (single config mode only)
-        num_kv_splits: Number of KV splits for CUTLASS (single config mode only)
+        reorder_batch_threshold: optional threshold override
         index_topk: Topk value for sparse MLA backends (default 2048)
-        prefill_backend: Prefill backend name (e.g., "fa3", "fa4").
-            When set, forces the specified FlashAttention version for prefill.
 
     Returns:
         BenchmarkResult (single mode) or list of BenchmarkResult (batched mode)
     """
-    # Normalize to batched mode: (config, threshold, num_splits)
+    if prefill_backend is not None:
+        raise ValueError(
+            "prefill_backend is not supported by the Kunlun-only MLA runner."
+        )
+    if num_kv_splits is not None:
+        raise ValueError(
+            "num_kv_splits is CUTLASS-specific and is not supported by the "
+            "Kunlun-only MLA runner."
+        )
+
+    # Normalize to batched mode: (config, threshold)
     if isinstance(config, list):
         # Already in batched format
         if len(config) > 0 and isinstance(config[0], tuple):
-            # Format: [(cfg, param), ...] where param is threshold or num_splits
-            if backend in ("flashattn_mla", "flashmla", "flashmla_sparse"):
-                configs_with_params = [(cfg, param, None) for cfg, param in config]
-            else:  # cutlass_mla, flashinfer_mla, or sparse backends
-                configs_with_params = [(cfg, None, param) for cfg, param in config]
+            # Format: [(cfg, threshold), ...].
+            configs_with_params = [(cfg, param) for cfg, param in config]
         else:
             # Format: [cfg, ...] - just configs
-            configs_with_params = [(cfg, None, None) for cfg in config]
+            configs_with_params = [(cfg, None) for cfg in config]
         return_single = False
     else:
         # Single config: convert to batched format
-        configs_with_params = [(config, reorder_batch_threshold, num_kv_splits)]
+        configs_with_params = [(config, reorder_batch_threshold)]
         return_single = True
 
     # Use unified batched execution
-    results = _run_mla_benchmark_batched(
-        backend, configs_with_params, index_topk, prefill_backend=prefill_backend
-    )
+    results = _run_mla_benchmark_batched(backend, configs_with_params, index_topk)
 
     # Return single result or list based on input
     return results[0] if return_single else results

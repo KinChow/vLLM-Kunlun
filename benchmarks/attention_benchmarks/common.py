@@ -16,6 +16,36 @@ from rich.console import Console
 from rich.table import Table
 
 
+class TorchAcceleratorAdapter:
+    """Small local adapter for torch.accelerator / torch.cuda differences."""
+
+    def __init__(self):
+        self._accelerator = getattr(torch, "accelerator", None)
+
+    def set_device_index(self, device):
+        if self._accelerator is not None:
+            return self._accelerator.set_device_index(device)
+        return torch.cuda.set_device(device)
+
+    def synchronize(self):
+        if self._accelerator is not None:
+            return self._accelerator.synchronize()
+        return torch.cuda.synchronize()
+
+    def memory_allocated(self, device=None):
+        if self._accelerator is not None:
+            return self._accelerator.memory_allocated(device)
+        return torch.cuda.memory_allocated(device)
+
+    def memory_reserved(self, device=None):
+        if self._accelerator is not None:
+            return self._accelerator.memory_reserved(device)
+        return torch.cuda.memory_reserved(device)
+
+
+ACCELERATOR = TorchAcceleratorAdapter()
+
+
 def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
     """
     Extract sorting key from batch spec: (batch_size, max_q_len, max_kv_len).
@@ -70,14 +100,56 @@ class MockKVBProj:
 
     Mimics ColumnParallelLinear behavior for kv_b_proj in MLA backends.
     Projects kv_c_normed to [qk_nope_head_dim + v_head_dim] per head.
+
+    NOTE (vLLM-Kunlun): unlike upstream's shape-only mock, the Kunlun MLA
+    impl calls `process_weights_after_loading` from `mla_runner.py` (the
+    real model-loading helper is unavailable in the benchmark harness).
+    That path lives in
+    `vllm_kunlun/v1/attention/backends/mla/common.py:1043` and reads:
+      * `self.weight`                — hard-asserted shape
+        `(num_heads * (qk_nope + v_head_dim), kv_lora_rank)` after `.T`;
+        cannot be `torch.empty(0)`.
+      * `self.quant_method`          — `isinstance(..., UnquantizedLinearMethod)`
+        check; cannot be `None`, otherwise the quantized branch is taken
+        and `apply()` blows up.
+      * `self.input_size_per_partition` — used by the quantized branch to
+        construct an identity matrix; populate even on the unquantized
+        path so future quant configs do not regress.
+    All fields below are therefore required, not optional.
     """
 
-    def __init__(self, num_heads: int, qk_nope_head_dim: int, v_head_dim: int):
+    def __init__(
+        self,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        v_head_dim: int,
+        kv_lora_rank: int = 512,
+        device: torch.device | None = None,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
         self.num_heads = num_heads
         self.qk_nope_head_dim = qk_nope_head_dim
         self.v_head_dim = v_head_dim
+        self.kv_lora_rank = kv_lora_rank
         self.out_dim = qk_nope_head_dim + v_head_dim
-        self.weight = torch.empty(0, dtype=torch.bfloat16)
+        weight_device = device if device is not None else torch.device("cpu")
+        # Real-shaped weight required by MLA's
+        # `process_weights_after_loading` shape assertion (see class docstring).
+        self.weight = torch.randn(
+            num_heads * self.out_dim,
+            kv_lora_rank,
+            dtype=dtype,
+            device=weight_device,
+        )
+        self.input_size_per_partition = kv_lora_rank
+        try:
+            from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+            self.quant_method = UnquantizedLinearMethod()
+        except Exception:
+            # Fallback only for environments where the linear module is
+            # absent; on Kunlun this should not be hit because MLA's
+            # isinstance() check expects a real instance.
+            self.quant_method = None
 
     def __call__(self, x: torch.Tensor) -> tuple[torch.Tensor]:
         """
@@ -91,12 +163,11 @@ class MockKVBProj:
                 [num_tokens, num_heads, qk_nope_head_dim + v_head_dim]
         """
         num_tokens = x.shape[0]
-        result = torch.randn(
+        weight = self.weight.to(device=x.device, dtype=x.dtype)
+        result = torch.matmul(x, weight.t()).view(
             num_tokens,
             self.num_heads,
             self.out_dim,
-            device=x.device,
-            dtype=x.dtype,
         )
         return (result,)  # Return as tuple to match ColumnParallelLinear API
 
@@ -216,16 +287,18 @@ class BenchmarkConfig:
     # "auto" or "fp8"
     kv_cache_dtype: str = "auto"
 
-    # MLA-specific
+    # MLA-specific. prefill_backend is retained for upstream YAML/CLI
+    # compatibility; Kunlun MLA does not expose separate prefill backend
+    # selection.
     prefill_backend: str | None = None
     kv_lora_rank: int | None = None
     qk_nope_head_dim: int | None = None
     qk_rope_head_dim: int | None = None
     v_head_dim: int | None = None
 
-    # Backend-specific tuning
-    num_kv_splits: int | None = None  # CUTLASS MLA
-    reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA
+    # Backend-specific tuning retained for upstream config compatibility.
+    num_kv_splits: int | None = None
+    reorder_batch_threshold: int | None = None
 
 
 @dataclass
@@ -462,21 +535,27 @@ def get_attention_scale(head_dim: int) -> float:
 
 
 def is_mla_backend(backend: str) -> bool:
+    """Check if backend is an MLA backend when the registry exists.
+
+    NOTE (vLLM-Kunlun): the upstream version unconditionally imports
+    `AttentionBackendEnum` and looks up by name. Two adjustments here:
+      1. Short-circuit Kunlun-specific backend names (`KUNLUN_ATTN`,
+         `KUNLUN_FLASHMLA`, `KUNLUN_FLASHMLA_SPARSE`, `CUSTOM`) before
+         the lookup, because they are not registered in the upstream
+         enum and would raise `KeyError`.
+      2. Move the import inside `try` and add `ModuleNotFoundError` to
+         the exception list, because vLLM v0.11.0 does not ship
+         `vllm.v1.attention.backends.registry` at all.
     """
-    Check if backend is an MLA backend using the AttentionBackendEnum.
-
-    Args:
-        backend: Backend name matching AttentionBackendEnum exactly
-        (e.g., "FLASHMLA_SPARSE")
-
-    Returns:
-        True if the backend is an MLA backend, False otherwise
-    """
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
-
+    if backend in ("KUNLUN_ATTN", "CUSTOM"):
+        return False
+    if backend in ("KUNLUN_FLASHMLA", "KUNLUN_FLASHMLA_SPARSE"):
+        return True
     try:
+        from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
         backend_enum = AttentionBackendEnum[backend]
         backend_class = backend_enum.get_class()
         return backend_class.is_mla()
-    except (KeyError, ValueError, ImportError, AttributeError):
+    except (KeyError, ValueError, ImportError, AttributeError, ModuleNotFoundError):
         return False

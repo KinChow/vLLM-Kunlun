@@ -16,25 +16,117 @@ import torch
 from ray.experimental.tqdm_ray import tqdm
 
 from vllm.model_executor.layers.fused_moe import fused_topk
-from vllm.model_executor.layers.fused_moe.activation import MoEActivation
-from vllm.model_executor.layers.fused_moe.all2all_utils import (
-    maybe_make_prepare_finalize,
-)
 from vllm.model_executor.layers.fused_moe.config import (
-    FusedMoEConfig,
-    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
-    RoutingMethodType,
     _get_config_dtype_str,
-)
-from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
-    TritonOrDeepGemmExperts,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import *
 from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
-from vllm.utils.argparse_utils import FlexibleArgumentParser
-from vllm.utils.torch_utils import set_random_seed
+
+# vLLM version compat: 0.11.0 exposes FlexibleArgumentParser at vllm.utils;
+# 0.15.1+ moves it to vllm.utils.argparse_utils.
+try:
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+except ImportError:  # pragma: no cover - fallback for vllm<=0.11.0
+    from vllm.utils import FlexibleArgumentParser
+
+# vLLM version compat: set_random_seed location moved in 0.15.1.
+try:
+    from vllm.utils.torch_utils import set_random_seed
+except ImportError:  # pragma: no cover - fallback for vllm<=0.11.0
+    from vllm.model_executor.utils import set_random_seed
+
+
+def _load_deep_gemm_components():
+    """Load DeepGEMM-only symbols across vLLM module layout changes."""
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+    )
+
+    try:
+        from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    except ImportError:  # pragma: no cover - fallback for older vLLM-Kunlun bases
+        class MoEActivation:
+            SILU = "silu"
+
+    try:
+        from vllm.model_executor.layers.fused_moe.all2all_utils import (
+            maybe_make_prepare_finalize,
+        )
+    except ImportError:  # pragma: no cover - fallback for older vLLM-Kunlun bases
+        def maybe_make_prepare_finalize(*args, **kwargs):
+            return None
+
+    try:
+        from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+    except ImportError:  # pragma: no cover - fallback for older vLLM-Kunlun bases
+        class RoutingMethodType:
+            TopK = "topk"
+
+    try:
+        from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
+            TritonOrDeepGemmExperts,
+        )
+    except ImportError:  # pragma: no cover - fallback for older vLLM-Kunlun bases
+        from vllm.model_executor.layers.fused_moe import TritonOrDeepGemmExperts
+
+    return (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        maybe_make_prepare_finalize,
+        RoutingMethodType,
+        TritonOrDeepGemmExperts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kunlun (torch_xmlir) integration layer
+# ---------------------------------------------------------------------------
+# Upstream code is preserved verbatim below; the additions here let the same
+# script auto-dispatch to Kunlun fused_moe when running on a torch_xmlir
+# build, without changing upstream logic on stock CUDA/ROCm.
+def _is_kunlun() -> bool:
+    """Detect whether the current PyTorch is the Kunlun (torch_xmlir) build."""
+    try:
+        import torch_xmlir  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+IS_KUNLUN = _is_kunlun()
+
+# Dtypes the Kunlun fused_moe path is currently validated against. Extend this
+# tuple as more dtypes get covered by KunlunOps.
+KUNLUN_SUPPORTED_DTYPES: tuple[torch.dtype, ...] = (torch.float16,)
+KUNLUN_DEFAULT_DTYPE: torch.dtype = torch.float16
+
+# Kunlun PyTorch (older base) may lack torch.accelerator / torch.Event used by
+# upstream. Provide minimal shims so upstream code below stays untouched.
+if IS_KUNLUN:
+    if not hasattr(torch, "accelerator"):
+        class _CudaAcceleratorShim:
+            @staticmethod
+            def synchronize():
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            @staticmethod
+            def empty_cache():
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            @staticmethod
+            def device_index(idx):
+                return torch.cuda.device(idx)
+
+        torch.accelerator = _CudaAcceleratorShim()  # type: ignore[attr-defined]
+    if not hasattr(torch, "Event"):
+        torch.Event = torch.cuda.Event  # type: ignore[attr-defined]
+
 
 FP8_DTYPE = current_platform.fp8_dtype()
 
@@ -107,6 +199,7 @@ def benchmark_config(
     num_iters: int = 100,
     block_quant_shape: list[int] = None,
     use_deep_gemm: bool = False,
+    enable_ep: bool = False,
 ) -> float:
     init_dtype = torch.float16 if use_fp8_w8a8 else dtype
     x = torch.randn(num_tokens, hidden_size, dtype=dtype)
@@ -220,10 +313,126 @@ def benchmark_config(
 
     input_gating = torch.empty(num_tokens, num_experts, dtype=torch.float32)
 
+    # Kunlun-only buffers (cheap to allocate; unused on stock CUDA path).
+    linear_weights = torch.randn(num_experts, hidden_size, dtype=dtype)
+    # Lazy-filled cache for KunlunOps.fused_moe_ep introspection so the
+    # getsource/signature lookup runs once instead of per iteration.
+    kunlun_ep_cache: dict = {}
+
     def prepare(i: int):
         input_gating.copy_(gating_output[i])
 
+    def run_kunlun_moe():
+        if use_fp8_w8a8 or use_int8_w8a16 or use_int4_w4a16 or use_deep_gemm:
+            raise NotImplementedError(
+                "Kunlun MoE benchmark adaptation currently supports unquantized "
+                "fp16 fused_moe only."
+            )
+
+        import vllm_kunlun.vllm_utils_wrapper  # noqa: F401
+        from vllm_kunlun.ops._kunlun_ops import KunlunOps as ops
+
+        if enable_ep:
+            if "introspected" not in kunlun_ep_cache:
+                try:
+                    from inspect import getsource, signature
+
+                    source = getsource(ops.fused_moe_ep)
+                    parameters = signature(ops.fused_moe_ep).parameters
+                except (TypeError, ValueError):
+                    source = ""
+                    parameters = {}
+                kunlun_ep_cache["introspected"] = True
+                kunlun_ep_cache["needs_manual_dispatch"] = (
+                    "selected_token.sum()," in source
+                )
+                kunlun_ep_cache["has_linear_weights"] = (
+                    "linear_weights" in parameters
+                )
+
+            if kunlun_ep_cache["needs_manual_dispatch"]:
+                local_router_logits = input_gating
+                if kunlun_ep_cache["has_linear_weights"]:
+                    local_router_logits = (
+                        x.to(linear_weights.dtype) @ linear_weights.T
+                    )
+
+                topk_weights = torch.empty(
+                    num_tokens,
+                    topk,
+                    dtype=local_router_logits.dtype,
+                    device=local_router_logits.device,
+                )
+                topk_ids = torch.empty(
+                    num_tokens,
+                    topk,
+                    dtype=torch.int32,
+                    device=local_router_logits.device,
+                )
+                block_static = torch.empty(
+                    0, dtype=torch.int32, device=local_router_logits.device
+                )
+                getattr(torch.ops, "_C").moe_softmax_topk(
+                    local_router_logits, topk_weights, topk_ids, block_static
+                )
+
+                topk_weights = topk_weights / topk_weights.sum(1, keepdim=True)
+                topk_weights = topk_weights.to(x.dtype)
+
+                out = torch.zeros(
+                    num_tokens * topk, hidden_size, dtype=x.dtype, device=x.device
+                )
+                repeat_x = x.repeat_interleave(topk, dim=0)
+                topk_ids_flat = topk_ids.flatten()
+                for i in range(num_experts):
+                    selected_indices = torch.nonzero(
+                        topk_ids_flat == i, as_tuple=False
+                    ).flatten()
+                    selected_count = selected_indices.numel()
+                    if selected_count == 0:
+                        continue
+
+                    cur_token = repeat_x.index_select(0, selected_indices)
+                    up_gate = torch.empty(
+                        selected_count,
+                        shard_intermediate_size // 2,
+                        dtype=cur_token.dtype,
+                        device=cur_token.device,
+                    )
+                    getattr(torch.ops, "_C").silu_and_mul(
+                        up_gate, cur_token @ w1[i].T
+                    )
+                    out.index_copy_(0, selected_indices, up_gate @ w2[i].T)
+
+                return (
+                    (
+                        out.view(num_tokens, topk, hidden_size)
+                        * topk_weights.unsqueeze(2)
+                    )
+                    .sum(dim=1)
+                    .to(x.dtype)
+                )
+
+            if kunlun_ep_cache["has_linear_weights"]:
+                return ops.fused_moe_ep(
+                    x, w1, w2, input_gating, linear_weights, 0, topk,
+                    renormalize=True, inplace=True,
+                )
+
+            return ops.fused_moe_ep(
+                x, w1, w2, input_gating, 0, topk,
+                renormalize=True, inplace=True,
+            )
+
+        return ops.fused_moe(
+            x, w1, w2, input_gating, 0, topk,
+            renormalize=True, inplace=True,
+        )
+
     def run():
+        if IS_KUNLUN:
+            return run_kunlun_moe()
+
         from vllm.model_executor.layers.fused_moe import override_config
 
         if use_fp8_w8a8:
@@ -245,6 +454,14 @@ def benchmark_config(
 
         deep_gemm_experts = None
         if use_deep_gemm:
+            (
+                FusedMoEConfig,
+                FusedMoEParallelConfig,
+                MoEActivation,
+                maybe_make_prepare_finalize,
+                RoutingMethodType,
+                TritonOrDeepGemmExperts,
+            ) = _load_deep_gemm_components()
             moe_config = (
                 FusedMoEConfig(
                     num_experts=num_experts,
@@ -305,6 +522,22 @@ def benchmark_config(
     # JIT compilation & warmup
     run()
     torch.accelerator.synchronize()
+
+    if IS_KUNLUN:
+        for _ in range(5):
+            run()
+        torch.accelerator.synchronize()
+
+        latencies: list[float] = []
+        for i in range(num_iters):
+            prepare(i)
+            torch.accelerator.synchronize()
+            start = time.perf_counter()
+            for _ in range(10):
+                run()
+            torch.accelerator.synchronize()
+            latencies.append(time.perf_counter() - start)
+        return sum(latencies) / (num_iters * 10) * 1e6
 
     # Capture 10 invocations with CUDA graph
     graph = torch.cuda.CUDAGraph()
@@ -528,7 +761,8 @@ class BenchmarkWorker:
         # Get the device ID to allocate tensors and kernels
         # on the respective GPU. This is required for Ray to work
         # correctly with multi-GPU tuning on the ROCm platform.
-        self.device_id = int(ray.get_gpu_ids()[0])
+        gpu_ids = ray.get_gpu_ids()
+        self.device_id = int(gpu_ids[0]) if gpu_ids else 0
 
     def benchmark(
         self,
@@ -543,10 +777,32 @@ class BenchmarkWorker:
         use_int4_w4a16: bool = False,
         block_quant_shape: list[int] = None,
         use_deep_gemm: bool = False,
+        enable_ep: bool = False,
     ) -> tuple[dict[str, int], float]:
         # local import to allow serialization by ray
 
         set_random_seed(self.seed)
+        if IS_KUNLUN:
+            # Kunlun fused_moe path does not consume a Triton config; use an
+            # empty placeholder so the upstream return signature is preserved.
+            config = {}
+            kernel_time = benchmark_config(
+                config,
+                num_tokens,
+                num_experts,
+                shard_intermediate_size,
+                hidden_size,
+                topk,
+                dtype,
+                use_fp8_w8a8,
+                use_int8_w8a16,
+                use_int4_w4a16=use_int4_w4a16,
+                num_iters=100,
+                block_quant_shape=block_quant_shape,
+                use_deep_gemm=use_deep_gemm,
+                enable_ep=enable_ep,
+            )
+            return config, kernel_time
         dtype_str = _get_config_dtype_str(
             dtype,
             use_int8_w8a16=use_int8_w8a16,
@@ -586,6 +842,7 @@ class BenchmarkWorker:
             num_iters=100,
             block_quant_shape=block_quant_shape,
             use_deep_gemm=use_deep_gemm,
+            enable_ep=enable_ep,
         )
         return config, kernel_time
 
@@ -603,6 +860,7 @@ class BenchmarkWorker:
         search_space: list[dict[str, int]],
         block_quant_shape: list[int],
         use_deep_gemm: bool,
+        enable_ep: bool = False,
     ) -> dict[str, int]:
         # local import to allow serialization by ray
         from vllm.platforms import current_platform
@@ -646,6 +904,7 @@ class BenchmarkWorker:
                         num_iters=20,
                         block_quant_shape=block_quant_shape,
                         use_deep_gemm=use_deep_gemm,
+                        enable_ep=enable_ep,
                     )
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
@@ -821,6 +1080,19 @@ def get_model_params(config):
 
 
 def resolve_dtype(config) -> torch.dtype:
+    if IS_KUNLUN:
+        # Kunlun fused_moe path is currently validated on a limited set of
+        # dtypes (see KUNLUN_SUPPORTED_DTYPES). Honor the model's torch_dtype
+        # when supported; otherwise fall back to KUNLUN_DEFAULT_DTYPE so we
+        # don't silently switch away from a supported request.
+        model_dtype = getattr(config, "torch_dtype", None) or getattr(
+            config, "dtype", None
+        )
+        if isinstance(model_dtype, str):
+            model_dtype = getattr(torch, model_dtype, None)
+        if model_dtype in KUNLUN_SUPPORTED_DTYPES:
+            return model_dtype
+        return KUNLUN_DEFAULT_DTYPE
     if current_platform.is_rocm():
         return torch.float16
 
@@ -938,6 +1210,37 @@ def main(args: argparse.Namespace):
         os.environ["ROCR_VISIBLE_DEVICES"] = val
         del os.environ["HIP_VISIBLE_DEVICES"]
 
+    if IS_KUNLUN:
+        if args.tune:
+            raise ValueError("Kunlun fused_moe path does not use Triton tuning.")
+        torch.set_default_device("cuda")
+        set_random_seed(args.seed)
+        outputs = [
+            (
+                {},
+                benchmark_config(
+                    {},
+                    batch_size,
+                    E,
+                    shard_intermediate_size,
+                    hidden_size,
+                    topk,
+                    dtype,
+                    use_fp8_w8a8,
+                    use_int8_w8a16,
+                    use_int4_w4a16,
+                    block_quant_shape=block_quant_shape,
+                    use_deep_gemm=use_deep_gemm,
+                    enable_ep=enable_ep,
+                ),
+            )
+            for batch_size in batch_sizes
+        ]
+        for batch_size, (config, kernel_time) in zip(batch_sizes, outputs):
+            print(f"Batch size: {batch_size}, config: {config}")
+            print(f"Kernel time: {kernel_time:.2f} us")
+        return
+
     ray.init()
     num_gpus = int(ray.available_resources()["GPU"])
     workers = [BenchmarkWorker.remote(args.seed) for _ in range(num_gpus)]
@@ -991,6 +1294,7 @@ def main(args: argparse.Namespace):
                     search_space,
                     block_quant_shape,
                     use_deep_gemm,
+                    enable_ep,
                 )
                 for batch_size in batch_sizes
             ],
@@ -1029,6 +1333,7 @@ def main(args: argparse.Namespace):
                     use_int4_w4a16,
                     block_quant_shape,
                     use_deep_gemm,
+                    enable_ep,
                 )
                 for batch_size in batch_sizes
             ],

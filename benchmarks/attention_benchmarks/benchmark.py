@@ -3,26 +3,25 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 """
-Universal vLLM Attention Benchmark
+vLLM-Kunlun Attention Benchmark
 
-Benchmark any attention backend with the extended grammar.
-Supports standard attention (Flash/Triton/FlashInfer) and MLA backends.
+Benchmark Kunlun standard attention and Kunlun MLA with the extended grammar.
 
 Examples:
-    # Standard attention
-    python benchmark.py --backends flash flashinfer --batch-specs "q2k" "8q1s1k"
+    # Standard attention.
+    python benchmark.py --backend KUNLUN_ATTN --batch-specs "q2k" "8q1s1k"
 
-    # MLA backends
-    python benchmark.py --backends cutlass_mla flashinfer_mla --batch-specs "64q1s1k"
+    # MLA.
+    python benchmark.py --backend KUNLUN_FLASHMLA --batch-specs "64q1s1k"
 
-    # Parameter sweep (CLI)
-    python benchmark.py --backend cutlass_mla \
+    # Kunlun MLA threshold sweep.
+    python benchmark.py --backend KUNLUN_FLASHMLA \
                         --batch-specs "64q1s1k" \
-                        --sweep-param num_kv_splits \
-                        --sweep-values 1 4 8 16
+                        --sweep-param reorder_batch_threshold \
+                        --sweep-values 32 64 128
 
-    # Parameter sweep (YAML config - recommended)
-    python benchmark.py --config configs/cutlass_numsplits.yaml
+    # YAML config.
+    python benchmark.py --config configs/standard_attention.yaml
 """
 
 import argparse
@@ -47,18 +46,26 @@ from common import (
     is_mla_backend,
 )
 
-from vllm.v1.worker.workspace import init_workspace_manager
+try:
+    from vllm.v1.worker.workspace import init_workspace_manager
+except ModuleNotFoundError:
+    # vLLM-Kunlun supports both v0.11.0 and v0.15.1; the workspace manager
+    # only exists on v0.15.1+ (where v1 worker landed). On v0.11.0 there is
+    # no `vllm.v1.worker.workspace`, so fall back to a no-op shim so the
+    # benchmark script can run unchanged across both versions.
+    def init_workspace_manager(device: str):
+        return None
 
 
 def run_standard_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
-    """Run standard attention benchmark (Flash/Triton/FlashInfer)."""
+    """Run Kunlun standard attention benchmark."""
     from runner import run_attention_benchmark
 
     return run_attention_benchmark(config)
 
 
 def run_mla_benchmark(config: BenchmarkConfig, **kwargs) -> BenchmarkResult:
-    """Run MLA benchmark with appropriate backend."""
+    """Run Kunlun MLA benchmark."""
     from mla_runner import run_mla_benchmark as run_mla
 
     return run_mla(
@@ -430,7 +437,7 @@ def generate_batch_specs_from_ranges(ranges: list[dict]) -> list[str]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Universal vLLM attention benchmark",
+        description="vLLM-Kunlun attention benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -446,8 +453,8 @@ def main():
         "--backends",
         "--decode-backends",
         nargs="+",
-        help="Decode backends to benchmark (flash, triton, flashinfer, cutlass_mla, "
-        "flashinfer_mla, flashattn_mla, flashmla)",
+        help="Backends to benchmark: KUNLUN_ATTN, KUNLUN_FLASHMLA, "
+        "KUNLUN_FLASHMLA_SPARSE",
     )
     parser.add_argument(
         "--backend",
@@ -456,8 +463,7 @@ def main():
     parser.add_argument(
         "--prefill-backends",
         nargs="+",
-        help="Prefill backends to compare (fa2, fa3, fa4). "
-        "Uses the first decode backend for impl construction.",
+        help="Unsupported in the Kunlun-only runner; kept for upstream CLI compatibility.",
     )
 
     # Batch specifications
@@ -499,7 +505,7 @@ def main():
     # Parameter sweep (use YAML config for advanced sweeps)
     parser.add_argument(
         "--sweep-param",
-        help="Parameter name to sweep (e.g., num_kv_splits, reorder_batch_threshold)",
+        help="Parameter name to sweep (e.g., reorder_batch_threshold)",
     )
     parser.add_argument(
         "--sweep-values",
@@ -515,7 +521,7 @@ def main():
     args = parser.parse_args()
 
     console = Console()
-    console.print("[bold cyan]vLLM Attention Benchmark[/]")
+    console.print("[bold cyan]vLLM-Kunlun Attention Benchmark[/]")
 
     # Load config from YAML if provided
     if args.config:
@@ -542,7 +548,8 @@ def main():
                 args.backends = yaml_config["decode_backends"]
                 args.backend = None
 
-        # Prefill backends (e.g., ["fa3", "fa4"])
+        # Kept only for parsing upstream YAMLs; the Kunlun MLA runner rejects
+        # non-empty values.
         args.prefill_backends = yaml_config.get("prefill_backends", None)
 
         # Check for special modes
@@ -645,13 +652,16 @@ def main():
         )
 
     # Determine backends
-    backends = args.backends or ([args.backend] if args.backend else ["flash"])
+    backends = args.backends or ([args.backend] if args.backend else ["KUNLUN_ATTN"])
     prefill_backends = getattr(args, "prefill_backends", None)
+    if prefill_backends:
+        raise ValueError(
+            "prefill_backends is not supported by the Kunlun-only benchmark. "
+            "Use KUNLUN_FLASHMLA as the unified MLA backend."
+        )
     if not args.batch_specs:
         args.batch_specs = ["q2k", "8q1s1k"]
     console.print(f"Backends: {', '.join(backends)}")
-    if prefill_backends:
-        console.print(f"Prefill backends: {', '.join(prefill_backends)}")
     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
     console.print(f"KV cache dtype: {args.kv_cache_dtype}")
     console.print(f"CUDA graphs: {args.cuda_graphs}")

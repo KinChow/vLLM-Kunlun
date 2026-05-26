@@ -1,6 +1,6 @@
-# vLLM Attention Benchmarking Suite
+# vLLM-Kunlun Attention Benchmarking Suite
 
-Fast, flexible benchmarking for vLLM attention and MLA backends with an extended batch specification grammar.
+Fast, flexible benchmarking for vLLM attention and MLA backends with an extended batch specification grammar. This is the Kunlun port of the upstream `attention_benchmarks` suite — the structure mirrors upstream and only the backend selection / hardware-specific bits are adapted for Kunlun.
 
 ## Quick Start
 
@@ -8,15 +8,14 @@ Fast, flexible benchmarking for vLLM attention and MLA backends with an extended
 cd benchmarks/attention_benchmarks
 
 # Run a pre-configured benchmark
-python benchmark.py --config configs/mla_decode.yaml
-python benchmark.py --config configs/mla_mixed_batch.yaml
-python benchmark.py --config configs/speculative_decode.yaml
 python benchmark.py --config configs/standard_attention.yaml
-python benchmark.py --config configs/reorder_threshold.yaml
+python benchmark.py --config configs/mla_decode.yaml
+python benchmark.py --config configs/mla_prefill.yaml
+python benchmark.py --config configs/mla_mixed_batch.yaml
 
 # Or run custom benchmarks
 python benchmark.py \
-    --backends flash flashinfer \
+    --backends KUNLUN_ATTN \
     --batch-specs "q2k" "8q1s1k" "2q2k_32q1s1k" \
     --output-csv results.csv
 ```
@@ -53,59 +52,49 @@ Mixed batches: Use _ to combine (e.g., "2q2k_32q1s1k")
 
 The suite includes several pre-configured YAML benchmark configurations:
 
-### MLA Decode Benchmark
-
-Tests pure decode performance across MLA backends with varying batch sizes and sequence lengths.
-
-```bash
-python benchmark.py --config configs/mla_decode.yaml
-```
-
-### MLA Mixed Batch Benchmark
-
-Tests chunked prefill performance with mixed prefill + decode batches.
-
-```bash
-python benchmark.py --config configs/mla_mixed_batch.yaml
-```
-
-### Speculative Decoding Benchmark
-
-Tests speculative decode scenarios (K-token verification) and reorder_batch_threshold optimization.
-
-```bash
-python benchmark.py --config configs/speculative_decode.yaml
-```
-
 ### Standard Attention Benchmark
 
-Tests standard attention backends (Flash/Triton/FlashInfer) with pure prefill, decode, and mixed batches.
+Tests Kunlun standard attention with pure prefill, decode, mixed batches, speculative decode, and context extension shapes.
 
 ```bash
 python benchmark.py --config configs/standard_attention.yaml
 ```
 
-### Reorder Threshold Study
+### MLA Decode Benchmark
 
-**Question:** At what query length does the prefill pipeline become faster than the decode pipeline?
-
-Tests query lengths from 1-1024 across 9 batch sizes to find the crossover point. Uses `decode_vs_prefill` mode to compare both pipelines for each query length.
+Tests pure decode performance on the Kunlun MLA backend with varying batch sizes and sequence lengths.
 
 ```bash
-python benchmark.py --config configs/reorder_threshold.yaml
+python benchmark.py --config configs/mla_decode.yaml
+```
+
+### MLA Prefill Benchmark
+
+Tests Kunlun MLA pure prefill, chunked prefill, and context extension shapes.
+
+```bash
+python benchmark.py --config configs/mla_prefill.yaml
+```
+
+### MLA Mixed Batch Benchmark
+
+Tests Kunlun MLA chunked prefill performance with mixed prefill + decode batches.
+
+```bash
+python benchmark.py --config configs/mla_mixed_batch.yaml
 ```
 
 ---
 
 ## Universal Benchmark
 
-The `benchmark.py` script handles **all** backends - both standard attention and MLA.
+The `benchmark.py` script handles **all** Kunlun backends - both standard attention and MLA.
 
-### Standard Attention (Flash/Triton/FlashInfer)
+### Standard Attention (KUNLUN_ATTN)
 
 ```bash
 python benchmark.py \
-    --backends flash triton flashinfer \
+    --backends KUNLUN_ATTN \
     --batch-specs "q2k" "8q1s1k" "2q2k_32q1s1k" \
     --num-layers 10 \
     --repeats 5 \
@@ -115,9 +104,8 @@ python benchmark.py \
 ### MLA Backends
 
 ```bash
-# Compare all MLA backends
 python benchmark.py \
-    --backends cutlass_mla flashinfer_mla flashattn_mla flashmla \
+    --backends KUNLUN_FLASHMLA \
     --batch-specs "64q1s1k" "64q1s4k" \
     --output-csv mla_results.csv
 ```
@@ -126,26 +114,13 @@ python benchmark.py \
 
 Use `--sweep-param` and `--sweep-values` to run parameter sweeps from the CLI:
 
-#### CUTLASS MLA num-splits Optimization
-
-**Question:** What is the optimal `num_kv_splits` for CUTLASS MLA?
-
-```bash
-python benchmark.py \
-    --backend cutlass_mla \
-    --batch-specs "64q1s1k" "64q1s4k" "64q1s16k" \
-    --sweep-param num_kv_splits \
-    --sweep-values 1 2 4 8 16 \
-    --output-json optimal_splits.json
-```
-
 #### Reorder Batch Threshold Optimization
 
 **Question:** What's the optimal `reorder_batch_threshold` for speculative decoding?
 
 ```bash
 python benchmark.py \
-    --backend flashmla \
+    --backend KUNLUN_FLASHMLA \
     --batch-specs "q4s1k" "q8s2k" \
     --sweep-param reorder_batch_threshold \
     --sweep-values 1 4 16 64 256 512 \
@@ -156,8 +131,7 @@ python benchmark.py \
 
 ```text
 --config CONFIG                     # Path to YAML config file (overrides other args)
---backends BACKEND [BACKEND ...]    # flash, triton, flashinfer, cutlass_mla,
-                                    # flashinfer_mla, flashattn_mla, flashmla
+--backends BACKEND [BACKEND ...]    # KUNLUN_ATTN, KUNLUN_FLASHMLA, KUNLUN_FLASHMLA_SPARSE
 --backend BACKEND                   # Single backend (alternative to --backends)
 --batch-specs SPEC [SPEC ...]       # Batch specifications using extended grammar
 
@@ -173,10 +147,11 @@ python benchmark.py \
 --repeats N                         # Repetitions
 --warmup-iters N                    # Warmup iterations
 --profile-memory                    # Profile memory usage
+--kv-cache-dtype {auto,fp8}
+--cuda-graphs / --no-cuda-graphs
 
 # Parameter sweeps
---sweep-param PARAM                 # Parameter name to sweep (e.g., num_kv_splits,
-                                    # reorder_batch_threshold)
+--sweep-param PARAM                 # Parameter name to sweep (e.g., reorder_batch_threshold)
 --sweep-values N [N ...]            # Values to sweep for the parameter
 
 # Output
@@ -184,49 +159,45 @@ python benchmark.py \
 --output-json FILE                  # Save to JSON
 ```
 
+`--prefill-backends` and `num_kv_splits` are retained only for upstream
+argument/config compatibility. The Kunlun-only MLA runner rejects non-empty
+prefill backend selection and rejects `num_kv_splits`.
+
 ## Hardware Requirements
 
 | Backend | Hardware |
 | ------- | -------- |
-| Flash/Triton/FlashInfer | Any CUDA GPU |
-| CUTLASS MLA | Blackwell (SM100+) |
-| FlashAttn MLA | Hopper (SM90+) |
-| FlashMLA | Hopper (SM90+) |
-| FlashInfer-MLA | Any CUDA GPU |
+| KUNLUN_ATTN | Kunlun P800+ |
+| KUNLUN_FLASHMLA | Kunlun P800+ |
+| KUNLUN_FLASHMLA_SPARSE | Kunlun P800+ |
+
+`standard_attention.yaml` uses a local Llama 3 config directory. By default the
+runner reads `benchmarks/attention_benchmarks/models/meta-llama/Meta-Llama-3-8B`;
+override it with `ATTN_BENCH_MODEL_DIR` when needed.
 
 ## Using MLA Runner Directly
 
-All MLA backends are available through `mla_runner.run_mla_benchmark()`:
+All Kunlun MLA backends are available through `mla_runner.run_mla_benchmark()`:
 
 ```python
 from mla_runner import run_mla_benchmark
 from common import BenchmarkConfig
 
 config = BenchmarkConfig(
-    backend="cutlass_mla",
+    backend="KUNLUN_FLASHMLA",
     batch_spec="64q1s4k",
     num_layers=10,
     head_dim=576,
     num_q_heads=128,
     num_kv_heads=1,
-    block_size=128,
+    block_size=64,
     device="cuda:0",
     repeats=5,
     warmup_iters=3,
 )
 
-# CUTLASS MLA with specific num_kv_splits
-result = run_mla_benchmark("cutlass_mla", config, num_kv_splits=4)
+result = run_mla_benchmark("KUNLUN_FLASHMLA", config, reorder_batch_threshold=64)
 print(f"Time: {result.mean_time:.6f}s")
-
-# FlashInfer-MLA
-result = run_mla_benchmark("flashinfer_mla", config)
-
-# FlashAttn MLA (Hopper SM90+)
-result = run_mla_benchmark("flashattn_mla", config, reorder_batch_threshold=64)
-
-# FlashMLA (Hopper SM90+)
-result = run_mla_benchmark("flashmla", config, reorder_batch_threshold=64)
 ```
 
 ## Python API

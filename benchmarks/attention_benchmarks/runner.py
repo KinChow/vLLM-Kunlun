@@ -1,21 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""
-Standard attention benchmark runner - shared utilities for non-MLA benchmarks.
-
-This module provides helpers for running standard attention backends
-(FlashAttention, Triton, FlashInfer) with real vLLM integration.
-"""
+"""Kunlun standard attention benchmark runner."""
 
 import logging
+import time
 import types
 from contextlib import contextmanager
 
 import numpy as np
 import torch
-from batch_spec import parse_batch_spec, reorder_for_flashinfer
-from common import BenchmarkConfig, BenchmarkResult, MockLayer, get_attention_scale
+
+from batch_spec import parse_batch_spec
+from common import (
+    ACCELERATOR,
+    BenchmarkConfig,
+    BenchmarkResult,
+    MockLayer,
+    get_attention_scale,
+)
 
 from vllm.config import (
     CacheConfig,
@@ -30,8 +33,6 @@ from vllm.config import (
 )
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
-    get_kv_cache_layout,
-    set_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec
 
@@ -41,28 +42,26 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 
 def _get_backend_config(backend: str) -> dict:
-    """
-    Get backend configuration from AttentionBackendEnum.
+    """Get Kunlun attention backend configuration."""
+    if backend != "KUNLUN_ATTN":
+        raise ValueError("Only KUNLUN_ATTN is supported by this benchmark runner.")
 
-    Args:
-        backend: Backend name matching AttentionBackendEnum exactly
-                 (e.g., "FLASH_ATTN", "TRITON_ATTN", "FLASHINFER")
+    from vllm_kunlun.platforms.kunlun import KunlunPlatform
+    import vllm_kunlun.ops.paged_attn as kunlun_paged_attn
+    from vllm_kunlun.v1.attention.backends.kunlun_attn import (
+        KunlunAttentionBackend,
+    )
 
-    Returns:
-        Dict with backend_class
-    """
-    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    # vLLM 0.11.0 may import paged_attn before the Kunlun platform plugin
+    # replaces UnspecifiedPlatform. Patch the module-level cached platform so
+    # Kunlun backend shape/layout code can call is_kunlun().
+    paged_current_platform = getattr(kunlun_paged_attn, "current_platform", None)
+    if paged_current_platform is not None and not callable(
+        getattr(paged_current_platform, "is_kunlun", None)
+    ):
+        kunlun_paged_attn.current_platform = KunlunPlatform()
 
-    try:
-        backend_enum = AttentionBackendEnum[backend]
-        backend_class = backend_enum.get_class()
-    except (KeyError, ValueError) as e:
-        valid_backends = [b.name for b in AttentionBackendEnum if b.name != "CUSTOM"]
-        raise ValueError(
-            f"Unknown backend: {backend}. Valid backends: {valid_backends}"
-        ) from e
-
-    return {"backend_class": backend_class}
+    return {"backend_class": KunlunAttentionBackend}
 
 
 @contextmanager
@@ -99,6 +98,12 @@ def _build_common_attn_metadata(
     query_start_loc_cpu = query_start_loc.cpu()
 
     seq_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    seq_lens_cpu = seq_lens.cpu()
+    num_computed_tokens_cpu = torch.tensor(
+        [kv_len - q_len for q_len, kv_len in zip(q_lens, kv_lens)],
+        dtype=torch.int32,
+        device="cpu",
+    )
     max_seq_len = int(seq_lens.max().item())
 
     max_blocks = (max(kv_lens) + block_size - 1) // block_size
@@ -110,18 +115,28 @@ def _build_common_attn_metadata(
 
     max_query_len = max(q_lens)
 
-    return CommonAttentionMetadata(
-        query_start_loc=query_start_loc,
-        query_start_loc_cpu=query_start_loc_cpu,
-        seq_lens=seq_lens,
-        num_reqs=batch_size,
-        num_actual_tokens=total_tokens,
-        max_query_len=max_query_len,
-        max_seq_len=max_seq_len,
-        block_table_tensor=block_table_tensor,
-        slot_mapping=slot_mapping,
-        causal=True,
-    )
+    metadata_kwargs = {
+        "query_start_loc": query_start_loc,
+        "query_start_loc_cpu": query_start_loc_cpu,
+        "seq_lens": seq_lens,
+        "num_reqs": batch_size,
+        "num_actual_tokens": total_tokens,
+        "max_query_len": max_query_len,
+        "max_seq_len": max_seq_len,
+        "block_table_tensor": block_table_tensor,
+        "slot_mapping": slot_mapping,
+        "causal": True,
+    }
+    fields = getattr(CommonAttentionMetadata, "__dataclass_fields__", {})
+    if "seq_lens_cpu" in fields:
+        metadata_kwargs["seq_lens_cpu"] = seq_lens_cpu
+    elif "_seq_lens_cpu" in fields:
+        metadata_kwargs["_seq_lens_cpu"] = seq_lens_cpu
+    if "num_computed_tokens_cpu" in fields:
+        metadata_kwargs["num_computed_tokens_cpu"] = num_computed_tokens_cpu
+    elif "_num_computed_tokens_cpu" in fields:
+        metadata_kwargs["_num_computed_tokens_cpu"] = num_computed_tokens_cpu
+    return CommonAttentionMetadata(**metadata_kwargs)
 
 
 def _create_vllm_config(
@@ -129,9 +144,17 @@ def _create_vllm_config(
     max_num_blocks: int,
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
+    import os
+    from pathlib import Path
+
+    model_dir = os.environ.get(
+        "ATTN_BENCH_MODEL_DIR",
+        str(Path(__file__).resolve().parent / "models/meta-llama/Meta-Llama-3-8B"),
+    )
+
     model_config = ModelConfig(
-        model="meta-llama/Meta-Llama-3-8B",
-        tokenizer="meta-llama/Meta-Llama-3-8B",
+        model=model_dir,
+        tokenizer=model_dir,
         trust_remote_code=False,
         dtype="auto",  # Use model's native dtype
         seed=0,
@@ -153,7 +176,7 @@ def _create_vllm_config(
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
     )
-    device_config = DeviceConfig()
+    device_config = DeviceConfig(device="cuda")
     load_config = LoadConfig()
     compilation_config = CompilationConfig()
 
@@ -235,40 +258,10 @@ def _create_metadata_builder(
     kv_cache_spec: FullAttentionSpec,
     vllm_config: VllmConfig,
     device: torch.device,
-    backend_name: str = "",
 ):
     """Create metadata builder instance."""
     layer_names = ["layer_0"]
     builder_cls = backend_class.get_builder_cls()
-
-    # Flashinfer needs get_per_layer_parameters mocked since we don't have
-    # real model layers registered
-    if backend_name == "FLASHINFER":
-        import unittest.mock
-
-        from vllm.v1.attention.backends.utils import PerLayerParameters
-
-        def mock_get_per_layer_parameters(vllm_config, layer_names, impl_cls):
-            head_size = vllm_config.model_config.get_head_size()
-            return {
-                layer_name: PerLayerParameters(
-                    window_left=-1,  # No sliding window
-                    logits_soft_cap=0.0,  # No soft cap
-                    sm_scale=1.0 / (head_size**0.5),  # Standard scale
-                )
-                for layer_name in layer_names
-            }
-
-        with unittest.mock.patch(
-            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
-            mock_get_per_layer_parameters,
-        ):
-            return builder_cls(
-                kv_cache_spec=kv_cache_spec,
-                layer_names=layer_names,
-                vllm_config=vllm_config,
-                device=device,
-            )
 
     return builder_cls(
         kv_cache_spec=kv_cache_spec,
@@ -288,22 +281,12 @@ def _create_input_tensors(
     total_q: int,
     device: torch.device,
     dtype: torch.dtype,
-    quantize_query: bool = False,
 ) -> tuple:
-    """Create Q, K, V input tensors for all layers.
-
-    When quantize_query is True, queries are cast to fp8 to match backends
-    that require query/key/value dtype consistency.
-    """
-    q_dtype = dtype
-    if quantize_query:
-        from vllm.platforms import current_platform
-
-        q_dtype = current_platform.fp8_dtype()
+    """Create Q, K, V input tensors for all layers."""
     q_list = [
         torch.randn(
             total_q, config.num_q_heads, config.head_dim, device=device, dtype=dtype
-        ).to(q_dtype)
+        )
         for _ in range(config.num_layers)
     ]
     k_list = [
@@ -354,17 +337,10 @@ def _create_kv_cache(
     # Compute inverse permutation to get back to logical view
     inv_order = [stride_order.index(i) for i in range(len(stride_order))]
 
-    # Use fp8 dtype for cache when requested.
-    cache_dtype = dtype
-    if config.kv_cache_dtype == "fp8":
-        from vllm.platforms import current_platform
-
-        cache_dtype = current_platform.fp8_dtype()
-
     cache_list = []
     for _ in range(config.num_layers):
         # Allocate in physical layout order (contiguous in memory)
-        cache = torch.zeros(*physical_shape, device=device, dtype=cache_dtype)
+        cache = torch.zeros(*physical_shape, device=device, dtype=dtype)
         # Permute to logical view
         cache = cache.permute(*inv_order)
         cache_list.append(cache)
@@ -407,7 +383,7 @@ def _run_single_benchmark(
                 attn_metadata,
                 output=out,
             )
-    torch.accelerator.synchronize()
+    ACCELERATOR.synchronize()
 
     # Optionally capture a CUDA graph after warmup.
     # Graph replay eliminates CPU launch overhead so timings reflect pure
@@ -443,22 +419,20 @@ def _run_single_benchmark(
     # Benchmark
     times = []
     for _ in range(config.repeats):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        start.record()
+        # On the Kunlun/P800 torch compatibility stack, torch.cuda.Event
+        # elapsed_time() returns 0. Use synchronized wall-clock timing.
+        ACCELERATOR.synchronize()
+        start_time = time.perf_counter()
         benchmark_fn()
-        end.record()
-
-        torch.accelerator.synchronize()
-        elapsed_ms = start.elapsed_time(end)
-        times.append(elapsed_ms / 1000.0 / config.num_layers)  # seconds per layer
+        ACCELERATOR.synchronize()
+        elapsed_s = time.perf_counter() - start_time
+        times.append(elapsed_s / config.num_layers)  # seconds per layer
 
     mem_stats = {}
     if config.profile_memory:
         mem_stats = {
-            "allocated_mb": torch.accelerator.memory_allocated(device) / 1024**2,
-            "reserved_mb": torch.accelerator.memory_reserved(device) / 1024**2,
+            "allocated_mb": ACCELERATOR.memory_allocated(device) / 1024**2,
+            "reserved_mb": ACCELERATOR.memory_reserved(device) / 1024**2,
         }
 
     return times, mem_stats
@@ -473,7 +447,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """
     Run standard attention benchmark with real kernels.
 
-    Supports: FLASH_ATTN, TRITON_ATTN, FLASHINFER
+    Supports: KUNLUN_ATTN
 
     Args:
         config: Benchmark configuration
@@ -482,15 +456,11 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         BenchmarkResult with timing and memory statistics
     """
     device = torch.device(config.device)
-    torch.accelerator.set_device_index(device)
+    ACCELERATOR.set_device_index(device)
 
     backend_cfg = _get_backend_config(config.backend)
 
     requests = parse_batch_spec(config.batch_spec)
-
-    if config.backend == "FLASHINFER":
-        requests = reorder_for_flashinfer(requests)
-
     q_lens = [r.q_len for r in requests]
     kv_lens = [r.kv_len for r in requests]
     total_q = sum(q_lens)
@@ -514,13 +484,6 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 backend_cfg, config, device, dtype
             )
 
-            # Set KV cache layout if the backend requires a specific one
-            # (e.g., FlashInfer requires HND on SM100/Blackwell for TRTLLM attention)
-            required_layout = backend_class.get_required_kv_cache_layout()
-            if required_layout is not None:
-                set_kv_cache_layout(required_layout)
-                get_kv_cache_layout.cache_clear()
-
             common_metadata = _build_common_attn_metadata(
                 q_lens, kv_lens, config.block_size, device
             )
@@ -533,7 +496,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             )
 
             builder = _create_metadata_builder(
-                backend_class, kv_cache_spec, vllm_config, device, config.backend
+                backend_class, kv_cache_spec, vllm_config, device
             )
 
             attn_metadata = builder.build(
@@ -541,12 +504,8 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 common_attn_metadata=common_metadata,
             )
 
-            # Only quantize queries when the impl supports it
-            quantize_query = config.kv_cache_dtype.startswith("fp8") and getattr(
-                impl, "supports_quant_query_input", False
-            )
             q_list, k_list, v_list = _create_input_tensors(
-                config, total_q, device, dtype, quantize_query=quantize_query
+                config, total_q, device, dtype
             )
 
             cache_list = _create_kv_cache(

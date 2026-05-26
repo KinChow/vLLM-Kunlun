@@ -1,4 +1,4 @@
-# MLA decode-only benchmark configuration
+# MLA decode-only benchmark configuration (Kunlun)
 
 model:
   name: "deepseek-v3"
@@ -10,7 +10,7 @@ model:
   qk_nope_head_dim: 128
   qk_rope_head_dim: 64
   v_head_dim: 128
-  block_size: 128  # CUTLASS MLA and FlashAttn MLA use 128
+  block_size: 64    # Kunlun hardware constraint
 
 # Model parameter sweep: simulate tensor parallelism by varying num_q_heads
 # TP=1: 128 heads, TP=2: 64 heads, TP=4: 32 heads, TP=8: 16 heads
@@ -49,23 +49,10 @@ batch_specs:
   - "32q1s32k"     # 32 requests, 32k KV cache
 
 backends:
-  - CUTLASS_MLA
-  - FLASHINFER_MLA
-  - FLASH_ATTN_MLA  # Hopper only
-  - FLASHMLA        # Hopper only
-  - TOKENSPEED_MLA  # Blackwell + R1 dims + FP8 KV (use --kv-cache-dtype fp8)
+  - KUNLUN_FLASHMLA
 
 device: "cuda:0"
 repeats: 100
 warmup_iters: 10
 profile_memory: true
-
-# Backend-specific tuning
-CUTLASS_MLA:
-  num_kv_splits: auto  # or specific value like 4, 8, 16
-
-FLASH_ATTN_MLA:
-  reorder_batch_threshold: 512
-
-FLASHMLA:
-  reorder_batch_threshold: 1
+cuda_graphs: true
