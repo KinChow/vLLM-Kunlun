@@ -128,6 +128,15 @@ if IS_KUNLUN:
         torch.Event = torch.cuda.Event  # type: ignore[attr-defined]
 
 
+def _init_kunlun_workspace_manager(device: str = "cuda") -> None:
+    """Initialize vLLM v1 workspaces required by Kunlun fused_moe."""
+    try:
+        from vllm.v1.worker.workspace import init_workspace_manager
+    except ModuleNotFoundError:
+        return
+    init_workspace_manager(device)
+
+
 FP8_DTYPE = current_platform.fp8_dtype()
 
 # Default interval for clearing Triton JIT cache during tuning
@@ -1214,6 +1223,7 @@ def main(args: argparse.Namespace):
         if args.tune:
             raise ValueError("Kunlun fused_moe path does not use Triton tuning.")
         torch.set_default_device("cuda")
+        _init_kunlun_workspace_manager("cuda")
         set_random_seed(args.seed)
         outputs = [
             (

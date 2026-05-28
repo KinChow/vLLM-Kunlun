@@ -16,20 +16,36 @@ The EP wrapper supports both observed `fused_moe_ep` signatures so the same
 script can run on v0.11.0 and v0.15.1 style containers. On non-Kunlun
 PyTorch the upstream Triton + CUDA Graph path is used unchanged.
 
+On v0.15.1-style Kunlun containers, the benchmark initializes the vLLM v1
+workspace manager before running `KunlunOps.fused_moe`. This is required for
+non-EP large-batch shapes that use the shared workspace path inside
+`fused_moe`; v0.11.0 containers that do not expose `vllm.v1.worker.workspace`
+fall back to a no-op.
+
 ## Smoke Configuration
 
-The default smoke values are recorded in
-`configs/qwen3_30b_a3b_smoke.env`.
+The default smoke values are recorded in `configs/qwen3_30b_a3b_smoke.env`.
+The default `MODEL` points to the config-only Qwen3-30B-A3B directory under
+`models/Qwen3-30B-A3B`. The benchmark only needs `config.json` for shape
+derivation; no model weights are loaded.
 
 ```bash
 source configs/qwen3_30b_a3b_smoke.env
-python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --batch-size $BATCH_SIZES --num-iters "$NUM_ITERS" --trust-remote-code
+python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --batch-size $BATCH_SIZES
 ```
 
 For EP:
 
 ```bash
-python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --enable-expert-parallel --batch-size $BATCH_SIZES --num-iters "$NUM_ITERS" --trust-remote-code
+python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --enable-expert-parallel --batch-size $BATCH_SIZES
+```
+
+For a full batch sweep:
+
+```bash
+source configs/qwen3_30b_a3b_smoke.env
+python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --batch-size $FULL_BATCH_SIZES
+python benchmark_moe.py --model "$MODEL" --tp-size "$TP_SIZE" --enable-expert-parallel --batch-size $FULL_BATCH_SIZES
 ```
 
 ## Limitations
