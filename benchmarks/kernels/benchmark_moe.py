@@ -529,6 +529,8 @@ def benchmark_config(
             )
 
     # JIT compilation & warmup
+    prepare(0)
+    torch.accelerator.synchronize()
     run()
     torch.accelerator.synchronize()
 
